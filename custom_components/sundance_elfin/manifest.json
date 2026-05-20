@@ -1,0 +1,12 @@
+{
+  "domain": "sundance_elfin",
+  "name": "Sundance Spa Elfin",
+  "codeowners": ["@your-github-username"],
+  "config_flow": true,
+  "documentation": "https://github.com/your-github-username/sundance-elfin-hacs",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/your-github-username/sundance-elfin-hacs/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}

@@ -1,0 +1,25 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sundance Spa Elfin",
+        "description": "Enter the connection details for your Elfin-EW11A adapter.",
+        "data": {
+          "host": "IP Address",
+          "port": "Port"
+        },
+        "data_description": {
+          "host": "The IP address of your Elfin-EW11A adapter",
+          "port": "The TCP port (default: 8899)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the Elfin adapter. Please check the IP address and port.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This Elfin adapter is already configured."
+    }
+  }
+}
