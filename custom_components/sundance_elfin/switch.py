@@ -28,7 +28,7 @@ async def async_setup_entry(
 
     for control in spa.controls:
         if control.options == list(OffOnState):
-            entities.append(SundancePumpSwitch(spa, control))
+            entities.append(SundancePumpSwitch(spa, entry.entry_id, control))
 
     async_add_entities(entities)
 
@@ -36,9 +36,9 @@ async def async_setup_entry(
 class SundancePumpSwitch(SundanceEntity, SwitchEntity):
     """Switch entity for spa pumps/blower."""
 
-    def __init__(self, spa: SpaClient, control: SpaControl) -> None:
+    def __init__(self, spa: SpaClient, entry_id: str, control: SpaControl) -> None:
         """Initialize pump switch."""
-        super().__init__(spa, f"switch_{control.control_type.name.lower()}")
+        super().__init__(spa, entry_id, f"switch_{control.control_type.name.lower()}")
         self._control = control
         self._attr_name = control.name
         self._attr_icon = "mdi:pump"

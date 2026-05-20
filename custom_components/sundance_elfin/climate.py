@@ -39,7 +39,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up climate entity."""
-    async_add_entities([SundanceClimate(entry.runtime_data)])
+    async_add_entities([SundanceClimate(entry.runtime_data, entry.entry_id)])
 
 
 class SundanceClimate(SundanceEntity, ClimateEntity):
@@ -52,9 +52,9 @@ class SundanceClimate(SundanceEntity, ClimateEntity):
     _attr_preset_modes = [PRESET_READY, PRESET_REST, PRESET_READY_IN_REST]
     _attr_translation_key = "spa"
 
-    def __init__(self, spa: SpaClient) -> None:
+    def __init__(self, spa: SpaClient, entry_id: str) -> None:
         """Initialize climate entity."""
-        super().__init__(spa, "climate")
+        super().__init__(spa, entry_id, "climate")
         self._attr_name = None  # Use device name
 
     @property

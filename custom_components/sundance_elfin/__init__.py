@@ -33,10 +33,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SundanceConfigEntry) -> 
 
     _LOGGER.info("Connecting to Sundance Spa at %s:%s", host, port)
 
-    # Create client with MAC address derived from host (fallback identifier)
-    # This is needed because Elfin adapters may not support module identification
-    mac_fallback = f"sundance_{host.replace('.', '_')}"
-    spa = SpaClient(host, port, mac_address=mac_fallback)
+    spa = SpaClient(host, port)
 
     try:
         if not await spa.connect():
