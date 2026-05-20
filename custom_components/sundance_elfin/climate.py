@@ -4,9 +4,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from pybalboa import SpaClient
-from pybalboa.enums import HeatMode, HeatState
-
 from homeassistant.components.climate import (
     ClimateEntity,
     ClimateEntityFeature,
@@ -19,6 +16,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import SundanceConfigEntry
 from .entity import SundanceEntity
+from .spa_client import SpaClient, HeatMode, HeatState
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -60,7 +58,9 @@ class SundanceClimate(SundanceEntity, ClimateEntity):
     @property
     def temperature_unit(self) -> str:
         """Return the unit of measurement."""
-        return UnitOfTemperature.CELSIUS
+        if self._spa.temperature_unit_celsius:
+            return UnitOfTemperature.CELSIUS
+        return UnitOfTemperature.FAHRENHEIT
 
     @property
     def current_temperature(self) -> float | None:

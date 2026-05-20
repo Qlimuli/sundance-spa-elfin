@@ -2,20 +2,20 @@
   "config": {
     "step": {
       "user": {
-        "title": "Sundance Spa",
-        "description": "Enter the connection details for your Spa WiFi adapter (Elfin-EW11A or similar).",
+        "title": "Sundance Spa (EW11/Elfin)",
+        "description": "Enter the connection details for your EW11/Elfin WiFi-to-RS485 adapter.\n\n**Important:** The EW11 must be configured in TCP Server (transparent) mode, NOT Modbus mode.",
         "data": {
           "host": "IP Address",
           "port": "Port"
         },
         "data_description": {
-          "host": "The IP address of your WiFi adapter",
-          "port": "The TCP port (default: 8899 for Elfin, 4257 for Balboa WiFi)"
+          "host": "The IP address of your EW11/Elfin adapter",
+          "port": "The TCP port (default: 8899)"
         }
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to the spa. Please check the IP address and port, and ensure the spa is powered on."
+      "cannot_connect": "Failed to connect to the spa. Check that:\n1. The IP address is correct\n2. The EW11 is in TCP Server mode (not Modbus)\n3. The spa is powered on\n4. Port 8899 is accessible"
     },
     "abort": {
       "already_configured": "This spa is already configured."

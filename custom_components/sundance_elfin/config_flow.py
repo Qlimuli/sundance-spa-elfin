@@ -1,17 +1,18 @@
 """Config flow for Sundance Spa Elfin integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 import voluptuous as vol
-from pybalboa import SpaClient
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.exceptions import HomeAssistantError
 
 from .const import DEFAULT_PORT, DOMAIN
+from .spa_client import SpaClient
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,7 +47,15 @@ class SundanceElfinConfigFlow(ConfigFlow, domain=DOMAIN):
                 if not await spa.connect():
                     errors["base"] = "cannot_connect"
                 else:
-                    await spa.async_configuration_loaded()
+                    # Try to load configuration
+                    try:
+                        await asyncio.wait_for(
+                            spa.async_configuration_loaded(), 
+                            timeout=15
+                        )
+                    except asyncio.TimeoutError:
+                        _LOGGER.warning("Config timeout - spa may still work")
+                    
                     model = spa.model or "Sundance Spa"
                     await spa.disconnect()
                     return self.async_create_entry(

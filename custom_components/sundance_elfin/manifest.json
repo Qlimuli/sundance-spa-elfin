@@ -1,12 +1,12 @@
 {
   "domain": "sundance_elfin",
-  "name": "Sundance Spa (Elfin WiFi)",
+  "name": "Sundance Spa (Elfin/EW11 WiFi)",
   "codeowners": ["@Qlimuli"],
   "config_flow": true,
   "documentation": "https://github.com/Qlimuli/v0-sundance-spa-elfin",
   "integration_type": "hub",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/Qlimuli/v0-sundance-spa-elfin/issues",
-  "requirements": ["pybalboa==1.0.2"],
-  "version": "1.0.0"
+  "requirements": [],
+  "version": "2.0.0"
 }

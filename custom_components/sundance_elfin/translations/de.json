@@ -2,20 +2,20 @@
   "config": {
     "step": {
       "user": {
-        "title": "Sundance Spa",
-        "description": "Gib die Verbindungsdaten deines Spa WiFi-Adapters ein (Elfin-EW11A oder ähnlich).",
+        "title": "Sundance Spa (EW11/Elfin)",
+        "description": "Gib die Verbindungsdaten deines EW11/Elfin WiFi-zu-RS485-Adapters ein.\n\n**Wichtig:** Der EW11 muss im TCP-Server-Modus (transparent) konfiguriert sein, NICHT im Modbus-Modus.",
         "data": {
           "host": "IP-Adresse",
           "port": "Port"
         },
         "data_description": {
-          "host": "Die IP-Adresse deines WiFi-Adapters",
-          "port": "Der TCP-Port (Standard: 8899 für Elfin, 4257 für Balboa WiFi)"
+          "host": "Die IP-Adresse deines EW11/Elfin-Adapters",
+          "port": "Der TCP-Port (Standard: 8899)"
         }
       }
     },
     "error": {
-      "cannot_connect": "Verbindung zum Spa fehlgeschlagen. Bitte überprüfe IP-Adresse und Port, und stelle sicher, dass der Spa eingeschaltet ist."
+      "cannot_connect": "Verbindung zum Spa fehlgeschlagen. Pruefe:\n1. Die IP-Adresse ist korrekt\n2. Der EW11 ist im TCP-Server-Modus (nicht Modbus)\n3. Der Spa ist eingeschaltet\n4. Port 8899 ist erreichbar"
     },
     "abort": {
       "already_configured": "Dieser Spa ist bereits konfiguriert."
@@ -25,6 +25,53 @@
     "climate": {
       "spa": {
         "name": "Spa"
+      }
+    },
+    "switch": {
+      "pump_1": {
+        "name": "Pumpe 1"
+      },
+      "pump_2": {
+        "name": "Pumpe 2"
+      },
+      "pump_3": {
+        "name": "Pumpe 3"
+      },
+      "blower": {
+        "name": "Geblaese"
+      }
+    },
+    "light": {
+      "light_1": {
+        "name": "Beleuchtung"
+      },
+      "light_2": {
+        "name": "Beleuchtung 2"
+      }
+    },
+    "binary_sensor": {
+      "heating": {
+        "name": "Heizung"
+      },
+      "circ_pump": {
+        "name": "Umwaelzpumpe"
+      },
+      "filtering": {
+        "name": "Filterung"
+      }
+    },
+    "sensor": {
+      "temperature": {
+        "name": "Wassertemperatur"
+      },
+      "target_temperature": {
+        "name": "Zieltemperatur"
+      },
+      "connection": {
+        "name": "Verbindungsstatus"
+      },
+      "spa_time": {
+        "name": "Spa-Uhrzeit"
       }
     }
   }

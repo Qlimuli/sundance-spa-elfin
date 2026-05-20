@@ -1,14 +1,12 @@
 """Base entity for Sundance Spa."""
 from __future__ import annotations
 
-from pybalboa import SpaClient
-from pybalboa.control import EVENT_UPDATE
-
 from homeassistant.core import callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity import Entity
 
 from .const import DOMAIN
+from .spa_client import SpaClient
 
 
 class SundanceEntity(Entity):
@@ -31,7 +29,7 @@ class SundanceEntity(Entity):
             name=self._spa.model if self._spa.model else "Sundance Spa",
             manufacturer="Sundance Spas",
             model=self._spa.model,
-            sw_version=self._spa.software_version if hasattr(self._spa, 'software_version') else None,
+            sw_version=self._spa.status.software_id if self._spa.status.software_id else None,
         )
 
     @property
@@ -41,7 +39,9 @@ class SundanceEntity(Entity):
 
     async def async_added_to_hass(self) -> None:
         """Run when entity is added to hass."""
-        self.async_on_remove(self._spa.on(EVENT_UPDATE, self._update_callback))
+        self.async_on_remove(
+            self._spa.add_update_callback(self._update_callback)
+        )
 
     @callback
     def _update_callback(self) -> None:

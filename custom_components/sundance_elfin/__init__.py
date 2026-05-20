@@ -4,14 +4,13 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from pybalboa import SpaClient
-
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
-from .const import DEFAULT_PORT
+from .const import DEFAULT_PORT, RECONNECT_INTERVAL
+from .spa_client import SpaClient
 
 _LOGGER = logging.getLogger(__name__)
 

@@ -3,9 +3,6 @@ from __future__ import annotations
 
 import logging
 
-from pybalboa import SpaClient
-from pybalboa.enums import HeatState
-
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
@@ -15,6 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import SundanceConfigEntry
 from .entity import SundanceEntity
+from .spa_client import SpaClient, HeatState
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,11 +24,14 @@ async def async_setup_entry(
 ) -> None:
     """Set up binary sensor entities."""
     spa = entry.runtime_data
-    async_add_entities([
-        SundanceHeatingSensor(spa),
-        SundanceFilterCycleSensor(spa, 1),
-        SundanceFilterCycleSensor(spa, 2),
-    ])
+    
+    entities = [
+        SundanceHeatingSensor(spa, entry.entry_id),
+        SundanceCircPumpSensor(spa, entry.entry_id),
+        SundanceFilteringSensor(spa, entry.entry_id),
+    ]
+    
+    async_add_entities(entities)
 
 
 class SundanceHeatingSensor(SundanceEntity, BinarySensorEntity):
@@ -38,9 +39,9 @@ class SundanceHeatingSensor(SundanceEntity, BinarySensorEntity):
 
     _attr_device_class = BinarySensorDeviceClass.HEAT
 
-    def __init__(self, spa: SpaClient) -> None:
+    def __init__(self, spa: SpaClient, entry_id: str) -> None:
         """Initialize heating sensor."""
-        super().__init__(spa, "heating")
+        super().__init__(spa, entry_id, "heating")
         self._attr_name = "Heating"
 
     @property
@@ -48,21 +49,53 @@ class SundanceHeatingSensor(SundanceEntity, BinarySensorEntity):
         """Return true if heating."""
         return self._spa.heat_state == HeatState.HEATING
 
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Return extra state attributes."""
+        return {
+            "heat_state": self._spa.heat_state.name,
+            "heat_mode": self._spa.heat_mode.name,
+        }
 
-class SundanceFilterCycleSensor(SundanceEntity, BinarySensorEntity):
+
+class SundanceCircPumpSensor(SundanceEntity, BinarySensorEntity):
+    """Binary sensor for circulation pump."""
+
+    _attr_device_class = BinarySensorDeviceClass.RUNNING
+
+    def __init__(self, spa: SpaClient, entry_id: str) -> None:
+        """Initialize circ pump sensor."""
+        super().__init__(spa, entry_id, "circ_pump")
+        self._attr_name = "Circulation Pump"
+        self._attr_icon = "mdi:pump"
+
+    @property
+    def is_on(self) -> bool:
+        """Return true if circulation pump is running."""
+        return self._spa.status.circ_pump
+
+
+class SundanceFilteringSensor(SundanceEntity, BinarySensorEntity):
     """Binary sensor for filter cycle."""
 
     _attr_device_class = BinarySensorDeviceClass.RUNNING
 
-    def __init__(self, spa: SpaClient, cycle: int) -> None:
+    def __init__(self, spa: SpaClient, entry_id: str) -> None:
         """Initialize filter cycle sensor."""
-        super().__init__(spa, f"filter_cycle_{cycle}")
-        self._cycle = cycle
-        self._attr_name = f"Filter Cycle {cycle}"
+        super().__init__(spa, entry_id, "filtering")
+        self._attr_name = "Filtering"
+        self._attr_icon = "mdi:filter"
 
     @property
     def is_on(self) -> bool:
-        """Return true if filter cycle running."""
-        if self._cycle == 1:
-            return self._spa.filter_cycle_1_running
-        return self._spa.filter_cycle_2_running
+        """Return true if filter cycle is active."""
+        return self._spa.status.filter_mode > 0
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Return extra state attributes."""
+        filter_mode = self._spa.status.filter_mode
+        mode_names = {0: "Off", 1: "Cycle 1", 2: "Cycle 2", 3: "Cycle 1 & 2"}
+        return {
+            "filter_mode": mode_names.get(filter_mode, f"Unknown ({filter_mode})")
+        }
