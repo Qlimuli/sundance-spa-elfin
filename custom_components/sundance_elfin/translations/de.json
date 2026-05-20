@@ -2,24 +2,30 @@
   "config": {
     "step": {
       "user": {
-        "title": "Sundance Spa Elfin",
-        "description": "Geben Sie die Verbindungsdaten für Ihren Elfin-EW11A Adapter ein.",
+        "title": "Sundance Spa",
+        "description": "Gib die Verbindungsdaten deines Spa WiFi-Adapters ein (Elfin-EW11A oder ähnlich).",
         "data": {
           "host": "IP-Adresse",
           "port": "Port"
         },
         "data_description": {
-          "host": "Die IP-Adresse Ihres Elfin-EW11A Adapters",
-          "port": "Der TCP-Port (Standard: 8899)"
+          "host": "Die IP-Adresse deines WiFi-Adapters",
+          "port": "Der TCP-Port (Standard: 8899 für Elfin, 4257 für Balboa WiFi)"
         }
       }
     },
     "error": {
-      "cannot_connect": "Verbindung zum Elfin-Adapter fehlgeschlagen. Bitte überprüfen Sie IP-Adresse und Port.",
-      "unknown": "Ein unerwarteter Fehler ist aufgetreten."
+      "cannot_connect": "Verbindung zum Spa fehlgeschlagen. Bitte überprüfe IP-Adresse und Port, und stelle sicher, dass der Spa eingeschaltet ist."
     },
     "abort": {
-      "already_configured": "Dieser Elfin-Adapter ist bereits konfiguriert."
+      "already_configured": "Dieser Spa ist bereits konfiguriert."
+    }
+  },
+  "entity": {
+    "climate": {
+      "spa": {
+        "name": "Spa"
+      }
     }
   }
 }

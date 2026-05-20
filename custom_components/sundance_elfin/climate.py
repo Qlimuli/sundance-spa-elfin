@@ -1,8 +1,11 @@
-"""Climate platform for Sundance Spa Elfin integration."""
+"""Climate platform for Sundance Spa."""
 from __future__ import annotations
 
 import logging
 from typing import Any
+
+from pybalboa import SpaClient
+from pybalboa.enums import HeatMode, HeatState
 
 from homeassistant.components.climate import (
     ClimateEntity,
@@ -10,118 +13,112 @@ from homeassistant.components.climate import (
     HVACAction,
     HVACMode,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .client import SundanceElfinClient
-from .const import (
-    CLIMATE_UNIQUE_ID,
-    DEFAULT_NAME,
-    DOMAIN,
-    MAX_TEMP,
-    MIN_TEMP,
-    TEMP_STEP,
-)
+from . import SundanceConfigEntry
+from .entity import SundanceEntity
 
 _LOGGER = logging.getLogger(__name__)
+
+PRESET_READY = "Ready"
+PRESET_REST = "Rest"
+PRESET_READY_IN_REST = "Ready in Rest"
+
+HEAT_MODE_MAP = {
+    HeatMode.READY: PRESET_READY,
+    HeatMode.REST: PRESET_REST,
+    HeatMode.READY_IN_REST: PRESET_READY_IN_REST,
+}
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: SundanceConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Sundance Spa climate entity."""
-    client: SundanceElfinClient = hass.data[DOMAIN][entry.entry_id]
-    
-    async_add_entities([SundanceSpaClimate(client, entry)])
+    """Set up climate entity."""
+    async_add_entities([SundanceClimate(entry.runtime_data)])
 
 
-class SundanceSpaClimate(ClimateEntity):
-    """Climate entity for controlling spa water temperature."""
+class SundanceClimate(SundanceEntity, ClimateEntity):
+    """Sundance Spa climate entity."""
 
-    _attr_has_entity_name = True
-    _attr_name = "Water Temperature"
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_hvac_modes = [HVACMode.HEAT, HVACMode.OFF]
-    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
-    _attr_min_temp = MIN_TEMP
-    _attr_max_temp = MAX_TEMP
-    _attr_target_temperature_step = TEMP_STEP
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
+    )
+    _attr_preset_modes = [PRESET_READY, PRESET_REST, PRESET_READY_IN_REST]
+    _attr_translation_key = "spa"
 
-    def __init__(self, client: SundanceElfinClient, entry: ConfigEntry) -> None:
-        """Initialize the climate entity."""
-        self._client = client
-        self._entry = entry
-        self._attr_unique_id = f"{entry.entry_id}_{CLIMATE_UNIQUE_ID}"
-        self._unregister_callback: callable | None = None
+    def __init__(self, spa: SpaClient) -> None:
+        """Initialize climate entity."""
+        super().__init__(spa, "climate")
+        self._attr_name = None  # Use device name
 
     @property
-    def device_info(self) -> DeviceInfo:
-        """Return device information."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._entry.entry_id)},
-            name=DEFAULT_NAME,
-            manufacturer="Sundance Spas",
-            model="Cameo 880",
-        )
+    def temperature_unit(self) -> str:
+        """Return the unit of measurement."""
+        return UnitOfTemperature.CELSIUS
 
     @property
     def current_temperature(self) -> float | None:
-        """Return the current water temperature."""
-        return self._client.state.current_temp
+        """Return the current temperature."""
+        return self._spa.temperature
 
     @property
     def target_temperature(self) -> float | None:
-        """Return the target water temperature."""
-        return self._client.state.target_temp
+        """Return the target temperature."""
+        return self._spa.target_temperature
+
+    @property
+    def min_temp(self) -> float:
+        """Return the minimum temperature."""
+        return self._spa.temperature_minimum
+
+    @property
+    def max_temp(self) -> float:
+        """Return the maximum temperature."""
+        return self._spa.temperature_maximum
 
     @property
     def hvac_mode(self) -> HVACMode:
-        """Return the current HVAC mode."""
-        # Spa is always in heat mode when on
-        return HVACMode.HEAT if self._client.state.connected else HVACMode.OFF
+        """Return current HVAC mode."""
+        if self._spa.heat_mode == HeatMode.REST:
+            return HVACMode.OFF
+        return HVACMode.HEAT
 
     @property
-    def hvac_action(self) -> HVACAction | None:
-        """Return the current HVAC action."""
-        if not self._client.state.connected:
-            return HVACAction.OFF
-        return HVACAction.HEATING if self._client.state.is_heating else HVACAction.IDLE
+    def hvac_action(self) -> HVACAction:
+        """Return current HVAC action."""
+        if self._spa.heat_state == HeatState.HEATING:
+            return HVACAction.HEATING
+        if self._spa.heat_state == HeatState.HEAT_WAITING:
+            return HVACAction.IDLE
+        return HVACAction.OFF
 
     @property
-    def available(self) -> bool:
-        """Return True if entity is available."""
-        return self._client.state.connected
+    def preset_mode(self) -> str | None:
+        """Return current preset mode."""
+        return HEAT_MODE_MAP.get(self._spa.heat_mode)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Set new target temperature."""
-        if (temperature := kwargs.get(ATTR_TEMPERATURE)) is not None:
-            await self._client.set_target_temperature(temperature)
+        if (temperature := kwargs.get(ATTR_TEMPERATURE)) is None:
+            return
+        await self._spa.set_temperature(temperature)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Set HVAC mode.
-        
-        Note: Most spas don't support turning off heating entirely via RS485.
-        This is here for Home Assistant compatibility but may not have an effect.
-        """
-        _LOGGER.debug("Set HVAC mode called with %s (may not be supported)", hvac_mode)
+        """Set HVAC mode."""
+        if hvac_mode == HVACMode.OFF:
+            await self._spa.set_heat_mode(HeatMode.REST)
+        else:
+            await self._spa.set_heat_mode(HeatMode.READY)
 
-    async def async_added_to_hass(self) -> None:
-        """Run when entity is added to Home Assistant."""
-        self._unregister_callback = self._client.register_callback(
-            self._handle_state_update
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Run when entity is about to be removed."""
-        if self._unregister_callback:
-            self._unregister_callback()
-
-    @callback
-    def _handle_state_update(self) -> None:
-        """Handle updated data from the client."""
-        self.async_write_ha_state()
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        """Set preset mode."""
+        for mode, name in HEAT_MODE_MAP.items():
+            if name == preset_mode:
+                await self._spa.set_heat_mode(mode)
+                return

@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
+
+from pybalboa import SpaClient
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
-from .client import SundanceElfinClient
-from .const import DOMAIN
+from .const import DOMAIN, DEFAULT_PORT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -17,55 +19,41 @@ PLATFORMS: list[Platform] = [
     Platform.CLIMATE,
     Platform.SWITCH,
     Platform.LIGHT,
+    Platform.BINARY_SENSOR,
     Platform.SENSOR,
 ]
 
+type SundanceConfigEntry = ConfigEntry[SpaClient]
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Sundance Spa Elfin from a config entry."""
+
+async def async_setup_entry(hass: HomeAssistant, entry: SundanceConfigEntry) -> bool:
+    """Set up Sundance Spa from a config entry."""
     host = entry.data[CONF_HOST]
-    port = entry.data[CONF_PORT]
-    
-    _LOGGER.info("Setting up Sundance Spa Elfin integration for %s:%s", host, port)
-    
-    # Create the TCP client
-    client = SundanceElfinClient(host=host, port=port)
-    
-    # Start the client (connects and begins listening for data)
-    await client.start()
-    
-    # Check if connection was successful
-    if not client.state.connected:
-        raise ConfigEntryNotReady(f"Failed to connect to Sundance Spa at {host}:{port}")
-    
-    # Store the client in hass.data
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = client
-    
-    # Set up platforms
+    port = entry.data.get(CONF_PORT, DEFAULT_PORT)
+
+    _LOGGER.info("Connecting to Sundance Spa at %s:%s", host, port)
+
+    spa = SpaClient(host, port)
+
+    try:
+        if not await spa.connect():
+            raise ConfigEntryNotReady(f"Unable to connect to spa at {host}:{port}")
+
+        await spa.async_configuration_loaded()
+    except Exception as err:
+        _LOGGER.error("Error connecting to spa: %s", err)
+        raise ConfigEntryNotReady from err
+
+    entry.runtime_data = spa
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    
-    # Register cleanup on unload
-    entry.async_on_unload(entry.add_update_listener(async_update_options))
-    
+
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: SundanceConfigEntry) -> bool:
     """Unload a config entry."""
-    _LOGGER.info("Unloading Sundance Spa Elfin integration")
-    
-    # Unload platforms
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    
-    if unload_ok:
-        # Stop and disconnect the client
-        client: SundanceElfinClient = hass.data[DOMAIN].pop(entry.entry_id)
-        await client.stop()
-    
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        await entry.runtime_data.disconnect()
+
     return unload_ok
-
-
-async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options update."""
-    await hass.config_entries.async_reload(entry.entry_id)
