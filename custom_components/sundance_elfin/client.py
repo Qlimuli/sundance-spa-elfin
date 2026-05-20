@@ -33,6 +33,15 @@ MSG_TYPE_TOGGLE = bytes([0xBF, 0x11])
 MSG_TYPE_SET_TEMP = bytes([0xBF, 0x20])
 # Set time
 MSG_TYPE_SET_TIME = bytes([0xBF, 0x21])
+# Acknowledgement/response messages (can be safely ignored)
+MSG_TYPE_ACK_06 = bytes([0xBF, 0x06])
+MSG_TYPE_ACK_07 = bytes([0xBF, 0x07])
+
+# Message types that are known but don't need processing
+KNOWN_IGNORED_MSG_TYPES = {
+    bytes([0xBF, 0x06]),  # Acknowledgement type 06
+    bytes([0xBF, 0x07]),  # Acknowledgement type 07
+}
 
 # Toggle item codes (from balboa_worldwide_app)
 TOGGLE_PUMP1 = 0x04
@@ -147,22 +156,28 @@ class SundanceElfinClient:
         self._lock = asyncio.Lock()
         self._buffer = b""
         
-        # Debug mode - logs all packets
-        self._debug = True
+        # Debug mode - logs all packets (set to False for production)
+        self._debug = False
         self._log_count = 0
-        self._max_logs_per_minute = 60  # Rate limit
+        self._max_logs_per_minute = 30  # Reduced rate limit
         self._log_reset_time = 0.0
         
     def _debug_log(self, msg: str, *args) -> None:
-        """Log debug messages with rate limiting."""
+        """Log debug messages with rate limiting.
+        
+        Uses DEBUG level to avoid flooding Home Assistant logs.
+        """
+        if not self._debug:
+            return
+            
         now = time.time()
         if now - self._log_reset_time > 60:
             self._log_count = 0
             self._log_reset_time = now
         
-        if self._debug and self._log_count < self._max_logs_per_minute:
+        if self._log_count < self._max_logs_per_minute:
             self._log_count += 1
-            _LOGGER.warning("[SUNDANCE] " + msg, *args)
+            _LOGGER.debug("[SUNDANCE] " + msg, *args)
     
     def register_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
         """Register a callback for state changes."""
@@ -383,8 +398,11 @@ class SundanceElfinClient:
         # Status message (0xAF 0x13)
         if msg_type == MSG_TYPE_STATUS:
             self._parse_status(data)
+        elif msg_type in KNOWN_IGNORED_MSG_TYPES:
+            # Known acknowledgement messages - silently ignore
+            pass
         else:
-            self._debug_log("Unknown msg type: %s (full: %s)", msg_type.hex(), msg.hex())
+            _LOGGER.debug("[SUNDANCE] Unknown msg type: %s (full: %s)", msg_type.hex(), msg.hex())
     
     def _parse_status(self, data: bytes) -> None:
         """Parse status message data.
@@ -409,15 +427,10 @@ class SundanceElfinClient:
         data[20] = target temperature
         """
         if len(data) < 21:
-            self._debug_log("Status too short: %d bytes (need 21+)", len(data))
+            _LOGGER.debug("[SUNDANCE] Status too short: %d bytes (need 21+)", len(data))
             return
         
-        # Log raw bytes for debugging
-        self._debug_log("STATUS RAW (%d bytes):", len(data))
-        for i, b in enumerate(data[:25]):
-            self._debug_log("  [%2d] = 0x%02x (%3d) %s", i, b, b, bin(b))
-        
-        # Store raw hex
+        # Store raw hex for diagnostic sensor
         self.state.last_raw_status = data.hex()
         
         try:
@@ -429,17 +442,12 @@ class SundanceElfinClient:
             
             # Current temperature
             raw_temp = data[2]
-            self._debug_log("RAW TEMP: data[2]=0x%02x (%d)", raw_temp, raw_temp)
             
             # Temperature scale from data[9]
             self.state.temp_scale_celsius = (data[9] & 0x01) == 0x01
             self.state.twenty_four_hour_time = (data[9] & 0x02) == 0x02
             self.state.filter1_running = (data[9] & 0x04) != 0
             self.state.filter2_running = (data[9] & 0x08) != 0
-            
-            self._debug_log("SCALE: celsius=%s, 24h=%s, filter1=%s, filter2=%s",
-                          self.state.temp_scale_celsius, self.state.twenty_four_hour_time,
-                          self.state.filter1_running, self.state.filter2_running)
             
             if raw_temp != 0xFF:
                 if self.state.temp_scale_celsius:
@@ -448,26 +456,20 @@ class SundanceElfinClient:
                 else:
                     # In Fahrenheit mode, convert to Celsius
                     self.state.current_temp = round((raw_temp - 32) * 5 / 9, 1)
-                self._debug_log("CURRENT TEMP: %.1f C", self.state.current_temp)
             else:
                 self.state.current_temp = None
-                self._debug_log("CURRENT TEMP: unavailable (0xFF)")
             
             # Time
             self.state.time_hour = data[3]
             self.state.time_minute = data[4]
-            self._debug_log("TIME: %02d:%02d", data[3], data[4])
             
             # Heating mode from data[5]
             heat_mode_val = data[5] & 0x03
             self.state.heat_mode = {0: "ready", 1: "rest", 2: "ready_in_rest"}.get(heat_mode_val, "ready")
-            self._debug_log("HEAT MODE: %s (raw=0x%02x)", self.state.heat_mode, data[5])
             
             # Heating state and temp range from data[10]
             self.state.is_heating = (data[10] & 0x30) != 0
             self.state.temperature_range = "high" if (data[10] & 0x04) else "low"
-            self._debug_log("HEATING: %s, RANGE: %s (raw=0x%02x)", 
-                          self.state.is_heating, self.state.temperature_range, data[10])
             
             # Pump states from data[11] - 2 bits each for pumps 1-4
             pumps = data[11]
@@ -475,9 +477,6 @@ class SundanceElfinClient:
             self.state.pump2_speed = (pumps >> 2) & 0x03
             self.state.pump3_speed = (pumps >> 4) & 0x03
             self.state.pump4_speed = (pumps >> 6) & 0x03
-            self._debug_log("PUMPS 1-4: %d %d %d %d (raw=0x%02x)", 
-                          self.state.pump1_speed, self.state.pump2_speed,
-                          self.state.pump3_speed, self.state.pump4_speed, pumps)
             
             # Pumps 5-6 from data[12]
             if len(data) > 12:
@@ -489,15 +488,11 @@ class SundanceElfinClient:
             if len(data) > 13:
                 self.state.circ_pump_on = (data[13] & 0x02) == 0x02
                 self.state.blower = (data[13] >> 2) & 0x03
-                self._debug_log("CIRC: %s, BLOWER: %d (raw=0x%02x)", 
-                              self.state.circ_pump_on, self.state.blower, data[13])
             
             # Lights from data[14]
             if len(data) > 14:
                 self.state.light1_on = (data[14] & 0x03) != 0
                 self.state.light2_on = ((data[14] >> 2) & 0x03) != 0
-                self._debug_log("LIGHTS: L1=%s L2=%s (raw=0x%02x)", 
-                              self.state.light1_on, self.state.light2_on, data[14])
             
             # Mister and aux from data[15]
             if len(data) > 15:
@@ -508,23 +503,13 @@ class SundanceElfinClient:
             # Target temperature from data[20]
             if len(data) > 20:
                 raw_target = data[20]
-                self._debug_log("RAW TARGET: data[20]=0x%02x (%d)", raw_target, raw_target)
                 if self.state.temp_scale_celsius:
                     self.state.target_temp = raw_target / 2.0
                 else:
                     self.state.target_temp = round((raw_target - 32) * 5 / 9, 1)
-                self._debug_log("TARGET TEMP: %.1f C", self.state.target_temp)
             
             self.state.status_updates += 1
             self.state.last_update = time.time()
-            
-            self._debug_log("=== STATUS #%d COMPLETE: %.1f/%.1f C, pumps=%d/%d, light=%s ===",
-                          self.state.status_updates,
-                          self.state.current_temp or 0,
-                          self.state.target_temp or 0,
-                          self.state.pump1_speed,
-                          self.state.pump2_speed,
-                          self.state.light1_on)
             
             self._notify()
             
