@@ -65,11 +65,13 @@ class SundanceSpaLight(LightEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
-        await self._client.set_light(True)
+        if not self._client.state.light_on:
+            await self._client.toggle_light()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
-        await self._client.set_light(False)
+        if self._client.state.light_on:
+            await self._client.toggle_light()
 
     async def async_added_to_hass(self) -> None:
         """Run when entity is added to Home Assistant."""

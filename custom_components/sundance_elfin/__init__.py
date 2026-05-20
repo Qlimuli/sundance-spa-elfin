@@ -31,12 +31,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Create the TCP client
     client = SundanceElfinClient(host=host, port=port)
     
-    # Try to connect
-    if not await client.connect():
-        raise ConfigEntryNotReady(f"Failed to connect to Sundance Spa at {host}:{port}")
-    
-    # Start the client (begins listening for data)
+    # Start the client (connects and begins listening for data)
     await client.start()
+    
+    # Check if connection was successful
+    if not client.state.connected:
+        raise ConfigEntryNotReady(f"Failed to connect to Sundance Spa at {host}:{port}")
     
     # Store the client in hass.data
     hass.data.setdefault(DOMAIN, {})

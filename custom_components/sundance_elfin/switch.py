@@ -75,17 +75,24 @@ class SundanceSpaPump(SwitchEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the pump on."""
+        # Pumps cycle through off -> low -> high -> off
+        # Keep toggling until we reach a non-off state
         if self._pump_number == 1:
-            await self._client.set_pump1(True)
+            if not self._client.state.pump1_on:
+                await self._client.toggle_pump1()
         else:
-            await self._client.set_pump2(True)
+            if not self._client.state.pump2_on:
+                await self._client.toggle_pump2()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the pump off."""
+        # Toggle until pump is off (may take 1-2 toggles depending on current speed)
         if self._pump_number == 1:
-            await self._client.set_pump1(False)
+            while self._client.state.pump1_on:
+                await self._client.toggle_pump1()
         else:
-            await self._client.set_pump2(False)
+            while self._client.state.pump2_on:
+                await self._client.toggle_pump2()
 
     async def async_added_to_hass(self) -> None:
         """Run when entity is added to Home Assistant."""

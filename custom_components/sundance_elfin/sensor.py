@@ -83,11 +83,15 @@ class SundanceSpaTemperatureSensor(SensorEntity):
         attrs = {
             "target_temperature": self._client.state.target_temp,
             "is_heating": self._client.state.is_heating,
+            "heat_mode": self._client.state.heat_mode,
             "pump1_speed": self._client.state.pump1_speed,
             "pump2_speed": self._client.state.pump2_speed,
             "light_on": self._client.state.light_on,
-            "raw_packets_received": self._client.state.raw_packets_received,
-            "status_packets_parsed": self._client.state.status_packets_parsed,
+            "time": f"{self._client.state.time_hour:02d}:{self._client.state.time_minute:02d}",
+            "error_code": self._client.state.error_code,
+            "packets_received": self._client.state.packets_received,
+            "status_updates": self._client.state.status_updates,
+            "last_raw_status": self._client.state.last_raw_status[:80] if self._client.state.last_raw_status else "",
         }
         if self._client.state.last_update:
             attrs["last_update"] = datetime.fromtimestamp(
