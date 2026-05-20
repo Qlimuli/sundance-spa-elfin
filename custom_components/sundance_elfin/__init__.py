@@ -1,8 +1,8 @@
 """The Sundance Spa Elfin integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any
 
 from pybalboa import SpaClient
 
@@ -11,7 +11,7 @@ from homeassistant.const import CONF_HOST, CONF_PORT, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
-from .const import DOMAIN, DEFAULT_PORT
+from .const import DEFAULT_PORT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,15 +33,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: SundanceConfigEntry) -> 
 
     _LOGGER.info("Connecting to Sundance Spa at %s:%s", host, port)
 
-    spa = SpaClient(host, port)
+    # Create client with MAC address derived from host (fallback identifier)
+    # This is needed because Elfin adapters may not support module identification
+    mac_fallback = f"sundance_{host.replace('.', '_')}"
+    spa = SpaClient(host, port, mac_address=mac_fallback)
 
     try:
         if not await spa.connect():
             raise ConfigEntryNotReady(f"Unable to connect to spa at {host}:{port}")
 
-        await spa.async_configuration_loaded()
+        # Wait for configuration with timeout - continue even if it fails
+        try:
+            await asyncio.wait_for(spa.async_configuration_loaded(), timeout=30)
+            _LOGGER.info("Spa configuration loaded successfully")
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "Timeout waiting for spa configuration - continuing with limited features"
+            )
+
     except Exception as err:
         _LOGGER.error("Error connecting to spa: %s", err)
+        await spa.disconnect()
         raise ConfigEntryNotReady from err
 
     entry.runtime_data = spa

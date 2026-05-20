@@ -20,6 +20,7 @@ class SundanceEntity(Entity):
     def __init__(self, spa: SpaClient, key: str) -> None:
         """Initialize the entity."""
         self._spa = spa
+        # Use mac_address which was set in __init__.py (either from spa or fallback)
         self._attr_unique_id = f"{spa.mac_address}_{key}"
 
     @property
@@ -27,7 +28,7 @@ class SundanceEntity(Entity):
         """Return device information."""
         return DeviceInfo(
             identifiers={(DOMAIN, self._spa.mac_address)},
-            name=self._spa.model or "Sundance Spa",
+            name=self._spa.model if self._spa.model else "Sundance Spa",
             manufacturer="Sundance Spas",
             model=self._spa.model,
             sw_version=self._spa.software_version,
