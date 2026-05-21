@@ -26,20 +26,20 @@ async def async_setup_entry(
 ) -> None:
     """Set up sensor entities."""
     spa = entry.runtime_data
-    
+
     entities = [
         SundanceTemperatureSensor(spa, entry.entry_id),
         SundanceTargetTemperatureSensor(spa, entry.entry_id),
         SundanceConnectionSensor(spa, entry.entry_id),
         SundanceTimeSensor(spa, entry.entry_id),
     ]
-    
+
     async_add_entities(entities)
 
 
 class SundanceTemperatureSensor(SundanceEntity, SensorEntity):
     """Sensor for current water temperature."""
-    
+
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
 
@@ -63,7 +63,7 @@ class SundanceTemperatureSensor(SundanceEntity, SensorEntity):
 
 class SundanceTargetTemperatureSensor(SundanceEntity, SensorEntity):
     """Sensor for target temperature."""
-    
+
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
 
@@ -87,7 +87,7 @@ class SundanceTargetTemperatureSensor(SundanceEntity, SensorEntity):
 
 class SundanceConnectionSensor(SundanceEntity, SensorEntity):
     """Sensor for connection status."""
-    
+
     _attr_icon = "mdi:wifi"
 
     def __init__(self, spa: SpaClient, entry_id: str) -> None:
@@ -103,16 +103,17 @@ class SundanceConnectionSensor(SundanceEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict:
         """Return extra state attributes."""
+        # FIX: software_id liegt in config, nicht in status
         return {
             "host": self._spa.host,
             "model": self._spa.model or "Unknown",
-            "software": self._spa.status.software_id or "Unknown",
+            "software": self._spa.config.software_id or "Unknown",
         }
 
 
 class SundanceTimeSensor(SundanceEntity, SensorEntity):
     """Sensor for spa time."""
-    
+
     _attr_icon = "mdi:clock"
 
     def __init__(self, spa: SpaClient, entry_id: str) -> None:
@@ -126,7 +127,7 @@ class SundanceTimeSensor(SundanceEntity, SensorEntity):
         status = self._spa.status
         if status.clock_24hr:
             return f"{status.hour:02d}:{status.minute:02d}"
-        
+
         hour_12 = status.hour % 12
         if hour_12 == 0:
             hour_12 = 12
