@@ -24,12 +24,14 @@ class SundanceEntity(Entity):
     @property
     def device_info(self) -> DeviceInfo:
         """Return device information."""
+        # FIX: software_id gehört zu SpaConfig, nicht SpaStatus
+        sw_ver = self._spa.config.software_id if self._spa.config.software_id else None
         return DeviceInfo(
             identifiers={(DOMAIN, self._entry_id)},
             name=self._spa.model if self._spa.model else "Sundance Spa",
             manufacturer="Sundance Spas",
-            model=self._spa.model,
-            sw_version=self._spa.status.software_id if self._spa.status.software_id else None,
+            model=self._spa.model if self._spa.model else None,
+            sw_version=sw_ver,
         )
 
     @property
