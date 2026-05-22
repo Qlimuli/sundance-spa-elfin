@@ -5,7 +5,7 @@
   "documentation": "https://github.com/HyperActiveJ/sundance780-jacuzzi-balboa-rs485-tcp",
   "issue_tracker": "https://github.com/HyperActiveJ/sundance780-jacuzzi-balboa-rs485-tcp/issues",
   "dependencies": [],
-  "codeowners": [],
+  "codeowners": ["@HyperActiveJ"],
   "requirements": [],
   "iot_class": "local_push",
   "config_flow": true

@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Sundance / Balboa Spa",
+        "description": "Enter the IP address and TCP port of the RS485-TCP adapter.",
+        "data": {
+          "host": "IP address / hostname",
+          "port": "TCP port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Connection failed – check IP or port",
+      "timeout": "Timeout – spa is not responding",
+      "no_data": "Connected but no spa data received",
+      "unknown": "Unknown error"
+    },
+    "abort": {
+      "already_configured": "This spa is already configured"
+    }
+  }
+}
