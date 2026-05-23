@@ -1,7 +1,7 @@
 {
   "domain": "sundance_spa",
   "name": "Sundance / Balboa Spa",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "documentation": "https://github.com/HyperActiveJ/sundance780-jacuzzi-balboa-rs485-tcp",
   "issue_tracker": "https://github.com/HyperActiveJ/sundance780-jacuzzi-balboa-rs485-tcp/issues",
   "dependencies": [],
