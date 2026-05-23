@@ -95,7 +95,12 @@ class SpaClimate(CoordinatorEntity, ClimateEntity):
             "display":     self._status.get("display"),
             "display_val": self._status["display_val"],
             "spa_time":    self._status["time"],
-            "raw_d8":      self._status["raw_d8"],
+            "raw_d8":          self._status["raw_d8"],
+            "assigned_channel": (
+                f"0x{self.coordinator.client.assigned_channel:02X}"
+                if self.coordinator.client.assigned_channel is not None
+                else None
+            ),
         }
 
     # ── HA-Aktionen ──────────────────────────────────────────────
