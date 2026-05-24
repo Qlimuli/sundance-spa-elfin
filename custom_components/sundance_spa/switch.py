@@ -1,4 +1,4 @@
-"""Sundance Spa – Switch Entities (Pumpen, Zirk, ClearRay)."""
+"""Sundance Spa – Switch Entities (Pumpen, Zirk, ClearRay, Blower)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,6 +14,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import (
     DOMAIN, SpaCoordinator,
     BTN_PUMP1, BTN_PUMP2, BTN_ZIRK, BTN_CLEARRAY,
+    BTN_BLOWER,   # NEU
 )
 
 
@@ -51,6 +52,14 @@ SWITCH_TYPES: list[SpaSwitch] = [
         icon_on="mdi:uv-fast", icon_off="mdi:uv-fast",
         button=BTN_CLEARRAY,
         getter=lambda s: s["circ_manual"],
+    ),
+    # ── NEU: Blower / Blubber ─────────────────────────────────────
+    SpaSwitch(
+        key="blower", name="Blubber / Luftsprudel",
+        icon_on="mdi:weather-windy",
+        icon_off="mdi:weather-windy-variant",
+        button=BTN_BLOWER,
+        getter=lambda s: s.get("blower", False),
     ),
 ]
 
@@ -113,6 +122,12 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
             return {
                 "circ_running": self._status["circ_running"],
                 "circ_manual":  self._status["circ_manual"],
+            }
+        # NEU: Blower-Rohwert als Attribut für Debugging
+        if self._sw.key == "blower" and self._status:
+            return {
+                "blower_raw": self._status.get("raw", [None] * 14)[13]
+                              if len(self._status.get("raw", [])) > 13 else None,
             }
         return {}
 
