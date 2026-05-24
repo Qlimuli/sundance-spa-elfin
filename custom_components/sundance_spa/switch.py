@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
+from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
@@ -12,20 +12,24 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import (
-    DOMAIN, SpaCoordinator,
-    BTN_PUMP1, BTN_PUMP2, BTN_ZIRK, BTN_CLEARRAY,
-    BTN_BLOWER,   # NEU
+    DOMAIN,
+    SpaCoordinator,
+    BTN_PUMP1,
+    BTN_PUMP2,
+    BTN_ZIRK,
+    BTN_CLEARRAY,
+    BTN_BLOWER,
 )
 
 
 @dataclass(frozen=True)
 class SpaSwitch:
-    key:         str
-    name:        str
-    icon_on:     str
-    icon_off:    str
-    button:      int
-    getter:      Callable[[dict], bool]
+    key:      str
+    name:     str
+    icon_on:  str
+    icon_off: str
+    button:   int
+    getter:   Callable[[dict], bool]
 
 
 SWITCH_TYPES: list[SpaSwitch] = [
@@ -53,7 +57,6 @@ SWITCH_TYPES: list[SpaSwitch] = [
         button=BTN_CLEARRAY,
         getter=lambda s: s["circ_manual"],
     ),
-    # ── NEU: Blower / Blubber ─────────────────────────────────────
     SpaSwitch(
         key="blower", name="Blubber / Luftsprudel",
         icon_on="mdi:weather-windy",
@@ -88,9 +91,9 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
         sw: SpaSwitch,
     ) -> None:
         super().__init__(coordinator)
-        self._sw   = sw
-        self._attr_unique_id  = f"{entry.entry_id}_{sw.key}"
-        self._attr_name       = sw.name
+        self._sw = sw
+        self._attr_unique_id   = f"{entry.entry_id}_{sw.key}"
+        self._attr_name        = sw.name
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
             name="Sundance Spa",
@@ -118,16 +121,17 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        if self._sw.key == "circ" and self._status:
+        if not self._status:
+            return {}
+        if self._sw.key == "circ":
             return {
                 "circ_running": self._status["circ_running"],
                 "circ_manual":  self._status["circ_manual"],
             }
-        # NEU: Blower-Rohwert als Attribut für Debugging
-        if self._sw.key == "blower" and self._status:
+        if self._sw.key == "blower":
+            raw = self._status.get("raw", [])
             return {
-                "blower_raw": self._status.get("raw", [None] * 14)[13]
-                              if len(self._status.get("raw", [])) > 13 else None,
+                "blower_raw_field13": raw[13] if len(raw) > 13 else None,
             }
         return {}
 
