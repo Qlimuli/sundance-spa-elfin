@@ -41,6 +41,7 @@ BTN_PUMP2      = 229
 BTN_CLEARRAY   = 239
 BTN_LIGHT      = 241
 BTN_ZIRK       = 242
+BTN_BLOWER     = 243
 HEAT_MODE_MAP  = {32: "AUTO", 34: "ECO", 36: "DAY"}
 DISPLAY_MAP = {
     22: "Solltemp-Änderung",
