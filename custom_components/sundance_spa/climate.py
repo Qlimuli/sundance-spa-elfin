@@ -29,16 +29,17 @@ async def async_setup_entry(
 
 
 class SpaClimate(CoordinatorEntity, ClimateEntity):
-    """Thermostat-Entität für den Whirlpool."""
+    """Thermostat-Entität für den Whirlpool (Sundance Cameo 880)."""
 
-    _attr_has_entity_name      = True
-    _attr_name                 = "Thermostat"
-    _attr_temperature_unit     = UnitOfTemperature.CELSIUS
-    _attr_min_temp             = 20.0
-    _attr_max_temp             = 40.0
+    _attr_has_entity_name         = True
+    _attr_name                    = "Thermostat"
+    _attr_temperature_unit        = UnitOfTemperature.CELSIUS
+    # Sundance Cameo 880 Hardware-Limits: 80 °F (26,7 °C) – 104 °F (40 °C)
+    _attr_min_temp                = 26.5
+    _attr_max_temp                = 40.0
     _attr_target_temperature_step = 0.5
-    _attr_hvac_modes           = [HVACMode.HEAT, HVACMode.OFF]
-    _attr_supported_features   = ClimateEntityFeature.TARGET_TEMPERATURE
+    _attr_hvac_modes              = [HVACMode.HEAT, HVACMode.OFF]
+    _attr_supported_features      = ClimateEntityFeature.TARGET_TEMPERATURE
 
     def __init__(self, coordinator: SpaCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator)
@@ -48,7 +49,7 @@ class SpaClimate(CoordinatorEntity, ClimateEntity):
             identifiers={(DOMAIN, entry.entry_id)},
             name="Sundance Spa",
             manufacturer="Sundance / Balboa",
-            model="RS485-TCP",
+            model="Cameo 880 (RS485-TCP)",
         )
 
     @property
@@ -68,6 +69,14 @@ class SpaClimate(CoordinatorEntity, ClimateEntity):
     @property
     def target_temperature(self) -> float | None:
         return self._status["set_temp"] if self._status else None
+
+    @property
+    def target_temperature_step(self) -> float:
+        # Bei °F-Mode des Spas effektiv 0,5 °C – die echte Quantisierung
+        # erfolgt im Treiber via _celsius_to_raw().
+        if self._status and not self._status.get("is_celsius", False):
+            return 0.5
+        return 0.5
 
     @property
     def hvac_mode(self) -> HVACMode:
@@ -90,12 +99,13 @@ class SpaClimate(CoordinatorEntity, ClimateEntity):
         if not self._status:
             return {}
         return {
-            "heat_mode":   self._status["heat_mode"],
-            "in_menu":     self._status["in_menu"],
-            "display":     self._status.get("display"),
-            "display_val": self._status["display_val"],
-            "spa_time":    self._status["time"],
-            "raw_d8":          self._status["raw_d8"],
+            "heat_mode":         self._status["heat_mode"],
+            "in_menu":           self._status["in_menu"],
+            "display":           self._status.get("display"),
+            "display_val":       self._status["display_val"],
+            "spa_time":          self._status["time"],
+            "raw_d8":            self._status["raw_d8"],
+            "is_celsius_mode":   self._status.get("is_celsius", False),
             "assigned_channel": (
                 f"0x{self.coordinator.client.assigned_channel:02X}"
                 if self.coordinator.client.assigned_channel is not None
@@ -117,5 +127,4 @@ class SpaClimate(CoordinatorEntity, ClimateEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         # Heizmodus wird vom Spa selbst gesteuert – kein direkter Button.
-        # Wir loggen es lediglich.
         pass
