@@ -98,7 +98,7 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
             identifiers={(DOMAIN, entry.entry_id)},
             name="Sundance Spa",
             manufacturer="Sundance / Balboa",
-            model="RS485-TCP",
+            model="Cameo 880 (RS485-TCP)",
         )
 
     @property
@@ -123,17 +123,22 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
     def extra_state_attributes(self) -> dict:
         if not self._status:
             return {}
+        attrs: dict = {}
         if self._sw.key == "circ":
-            return {
+            attrs.update({
                 "circ_running": self._status["circ_running"],
                 "circ_manual":  self._status["circ_manual"],
-            }
+            })
         if self._sw.key == "blower":
             raw = self._status.get("raw", [])
-            return {
+            # Debug-Felder, damit man das richtige Blower-Bit verifizieren kann
+            attrs.update({
+                "blower_raw_field3":  raw[3]  if len(raw) > 3  else None,
                 "blower_raw_field13": raw[13] if len(raw) > 13 else None,
-            }
-        return {}
+                "blower_raw_field14": raw[14] if len(raw) > 14 else None,
+                "button_code":        self._sw.button,
+            })
+        return attrs
 
     async def async_turn_on(self, **kwargs) -> None:
         if self.is_on:
