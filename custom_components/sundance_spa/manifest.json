@@ -1,11 +1,11 @@
 {
   "domain": "sundance_spa",
-  "name": "Sundance / Balboa Spa",
-  "version": "1.1.0",
-  "documentation": "https://github.com/HyperActiveJ/sundance780-jacuzzi-balboa-rs485-tcp",
-  "issue_tracker": "https://github.com/HyperActiveJ/sundance780-jacuzzi-balboa-rs485-tcp/issues",
+  "name": "Sundance Spa 880 (Elfin EW11)",
+  "version": "1.0.0",
+  "documentation": "https://github.com/Qlimuli/v0-sundance-spa-elfin",
+  "issue_tracker": "https://github.com/Qlimuli/v0-sundance-spa-elfin/issues",
   "dependencies": [],
-  "codeowners": ["@HyperActiveJ"],
+  "codeowners": ["@Qlimuli"],
   "requirements": [],
   "iot_class": "local_push",
   "config_flow": true
