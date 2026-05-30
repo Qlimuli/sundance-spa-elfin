@@ -137,10 +137,11 @@ def _build_nack(channel: int) -> bytes:
 
 
 def _build_c6_temp(target_temp: float, channel: int) -> bytes:
-    """Verbessertes C6-Paket für Sundance Cameo 880."""
+    """Original + verbessertes Logging + 0.5°C Rundung"""
     target_temp = max(20.0, min(40.0, round(target_temp * 2) / 2.0))
     raw_temp = int(round(target_temp * 2)) & 0xFF
-
+    _LOGGER.debug("Baue C6-Paket: Ziel=%.1f°C → raw=0x%02X auf Kanal 0x%02X", target_temp, raw_temp, channel)
+    
     msg = bytearray(9)
     msg[0] = M_STARTEND
     msg[1] = 7
@@ -364,6 +365,16 @@ class SpaClient:
                 return True
         return False
 
+    async def wait_lights(self, n: int = 3, timeout: float = 4.0) -> bool:
+        start = self._lights_seq
+        elapsed = 0.0
+        while elapsed < timeout:
+            await asyncio.sleep(0.1)
+            elapsed += 0.1
+            if self._lights_seq >= start + n:
+                return True
+        return False
+
     async def wait_ready(self, timeout: float = 10.0) -> bool:
         elapsed = 0.0
         while elapsed < timeout:
@@ -372,6 +383,22 @@ class SpaClient:
             await asyncio.sleep(0.2)
             elapsed += 0.2
         return False
+
+    @property
+    def status(self) -> dict | None:
+        return self._status
+
+    @property
+    def lights(self) -> dict | None:
+        return self._lights
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def assigned_channel(self) -> int | None:
+        return self._assigned_channel
 
     async def _status_snapshot(self) -> dict | None:
         async with self._lock:
@@ -384,7 +411,7 @@ class SpaClient:
         return self._assigned_channel or CMD_CHANNEL
 
     async def set_temperature(self, target: float) -> None:
-        """Verbesserte Temperatur-Steuerung für Sundance Cameo 880."""
+        """Verbesserte Temperatursteuerung mit ausführlichem Logging"""
         target = max(20.0, min(40.0, round(target * 2) / 2.0))
         raw_target = int(round(target * 2))
 
@@ -394,12 +421,16 @@ class SpaClient:
             if not snap:
                 raise UpdateFailed("Kein Status vom Spa")
 
-            if abs(snap["set_temp"] - target) < 0.3:
+            current = snap.get("set_temp")
+            _LOGGER.info("🔧 set_temperature() aufgerufen: aktuell=%.1f°C, Ziel=%.1f°C (raw=0x%02X)", 
+                        current, target, raw_target)
+
+            if abs(current - target) < 0.3:
+                _LOGGER.info("Temperatur bereits nah genug am Ziel")
                 return
 
-            _LOGGER.info("C6 Setze Temperatur auf %.1f°C (raw=0x%02X)", target, raw_target)
-
-            for attempt in range(5):
+            for attempt in range(4):
+                _LOGGER.debug("C6 Versuch %d: Sende Paket für %.1f°C", attempt+1, target)
                 pkt = _build_c6_temp(target, channel)
                 await self._send_q.put(pkt)
                 await self.wait_status(n=8, timeout=8.0)
@@ -407,16 +438,17 @@ class SpaClient:
                 deadline = time.monotonic() + 10.0
                 while time.monotonic() < deadline:
                     cur = await self._status_snapshot()
-                    if cur and abs(cur["set_temp"] - target) < 0.4:
-                        _LOGGER.info("✅ Temperatur erfolgreich auf %.1f°C gesetzt", cur["set_temp"])
+                    if cur and abs(cur.get("set_temp", 0) - target) < 0.4:
+                        _LOGGER.info("✅ Temperatur erfolgreich auf %.1f°C gesetzt!", cur["set_temp"])
                         return
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.25)
 
                 _LOGGER.warning("C6 Versuch %d fehlgeschlagen", attempt + 1)
                 await self._write_direct(_build_nack(channel))
                 await asyncio.sleep(0.5)
 
-            raise UpdateFailed(f"Temperatur konnte nicht auf {target:.1f}°C gesetzt werden (bleibt bei 41°C)")
+            _LOGGER.error("❌ Alle C6-Versuche fehlgeschlagen. Temperatur bleibt bei 41°C")
+            raise UpdateFailed(f"Temperatur konnte nicht auf {target:.1f}°C gesetzt werden")
 
 
 # ── DataUpdateCoordinator ────────────────────────────────────────────────────
