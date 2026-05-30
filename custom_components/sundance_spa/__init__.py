@@ -39,10 +39,10 @@ CLIENT_TYPE_PANEL = 0x02
 BTN_PUMP1       = 228
 BTN_PUMP2       = 229
 BTN_CLEARRAY    = 239
-BTN_LIGHT       = 241   # Licht An/Aus + Helligkeit-Stufe
-BTN_LIGHT_COLOR = 242   # Licht-Farbe / Effekt weiterschalten  ← NEU (war BTN_ZIRK)
-BTN_ZIRK        = 242   # Auto-Zirkulation  (gleicher Code! Kontext-abhängig)
-BTN_BLOWER      = 243   # Blubber / Luftsprudel
+BTN_LIGHT       = 241
+BTN_LIGHT_COLOR = 242
+BTN_ZIRK        = 242
+BTN_BLOWER      = 243
 
 # ── Lookup-Tabellen ──────────────────────────────────────────────────────────
 HEAT_MODE_MAP = {32: "AUTO", 34: "ECO", 36: "DAY"}
@@ -111,7 +111,6 @@ def _build_cc(btn: int, channel: int = CMD_CHANNEL) -> bytes:
 
 
 def _build_channel_request() -> bytes:
-    """Channel-Assignment auf Broadcast 0xFE (Sundance Cameo / Balboa)."""
     msg = bytearray(8)
     msg[0] = M_STARTEND
     msg[1] = 6
@@ -125,7 +124,6 @@ def _build_channel_request() -> bytes:
 
 
 def _build_nack(channel: int) -> bytes:
-    """Bereitschaft auf zugewiesenem Kanal signalisieren."""
     msg = bytearray(8)
     msg[0] = M_STARTEND
     msg[1] = 6
@@ -155,29 +153,69 @@ def _build_c6_temp(target_temp: float, channel: int) -> bytes:
 
 
 def _decode_c4(raw: bytes) -> dict | None:
-    d = _xormsg(raw[5:len(raw) - 2])
-    if len(d) < 15:
+    """
+    Dekodiert ein C4-Statuspaket.
+
+    Paketstruktur (nach den 5 Header-Bytes, vor den 2 End-Bytes):
+      raw[5] .. raw[-2]  → verschlüsselter Payload
+
+    Der Sundance Cameo 880 (Balboa) liefert den Payload NICHT
+    XOR-verschlüsselt – die Bytes werden direkt verwendet.
+
+    FIX: Soll-Temperatur steht in Byte 5 des Roh-Payloads (raw[10]),
+         Ist-Temperatur in Byte 3 (raw[8]).  Beide als °C × 2.
+    """
+    # Roh-Payload (ohne Start, Länge, Kanal, Typ, Src und CS/End)
+    payload = raw[5:len(raw) - 2]
+    if len(payload) < 15:
         return None
-    circ = (d[1] >> 6) & 1
+
+    # ── Klartext-Extraktion (kein XOR!) ──────────────────────────────────────
+    # Byte-Offsets im Payload (0-basiert):
+    #   0  : Stunde (BCD)
+    #   1  : Flags (Pumpen, Zirkulation …)
+    #   2  : Flags (Pumpe1 …)
+    #   3  : Ist-Temperatur raw (°C × 2); 0xFF = ungültig
+    #   4  : Heizmodus (32=AUTO, 34=ECO, 36=DAY)
+    #   5  : Soll-Temperatur raw (°C × 2)         ← FIX
+    #   6  : Heiz-Flags (Bit6 = heizend)
+    #   7  : Minuten
+    #   8  : reserviert / Display-Code
+    #   ...
+    # (abgeleitet aus dem Balboa-Protokoll-Standard und dem
+    #  Referenzprojekt HyperActiveJ/sundance780)
+
+    p = payload  # Kurzname
+
+    cur_temp_raw = p[3]
+    cur_temp     = cur_temp_raw / 2.0 if cur_temp_raw != 0xFF else None
+
+    set_temp_raw = p[5]                          # ← FIX (vorher d[8] nach XOR)
+    set_temp     = set_temp_raw / 2.0
+
+    heat_mode_raw = p[4]
+    heat_active   = bool((p[6] >> 6) & 1)
+
+    circ          = bool((p[1] >> 6) & 1)
+
     return {
-        "time":         f"{d[0] ^ 6:02d}:{d[11]:02d}",
-        "cur_temp":     (d[5] ^ 2) / 2.0 if (d[5] ^ 2) != 255 else None,
-        "set_temp":     d[8] / 2.0,
-        "heat_active":  bool((d[10] >> 6) & 1),
-        "heat_mode":    HEAT_MODE_MAP.get(d[6], f"0x{d[6]:02X}"),
-        "pump1":        bool((d[2] >> 4) & 1),
-        "pump2":        bool((d[1] >> 2) & 1),
+        "time":         f"{p[0]:02d}:{p[7]:02d}",
+        "cur_temp":     cur_temp,
+        "set_temp":     set_temp,
+        "set_temp_raw": set_temp_raw,             # ← NEU: für verlässliche Bestätigung
+        "heat_active":  heat_active,
+        "heat_mode":    HEAT_MODE_MAP.get(heat_mode_raw, f"0x{heat_mode_raw:02X}"),
+        "pump1":        bool((p[2] >> 4) & 1),
+        "pump2":        bool((p[1] >> 2) & 1),
         "circ":         bool(circ),
-        "circ_manual":  bool((d[1] >> 7) & 1),
-        "circ_running": bool((d[1] >> 5) & 1),
-        # Blower/Blubber: Feld 13, Bits 2-3 (Balboa Standard)
-        # Falls der Wert immer 0 ist → Button-Code per Sniffing bestimmen
-        "blower":       bool((d[13] >> 2) & 0x03),
-        "display_val":  d[13],
-        "display":      DISPLAY_MAP.get(d[13], f"Code {d[13]}"),
-        "in_menu":      d[13] not in DISPLAY_TEMP_OK,
-        "raw_d8":       d[8],
-        "raw":          list(d),
+        "circ_manual":  bool((p[1] >> 7) & 1),
+        "circ_running": bool((p[1] >> 5) & 1),
+        "blower":       bool((p[13] >> 2) & 0x03) if len(p) > 13 else False,
+        "display_val":  p[8] if len(p) > 8 else 0,
+        "display":      DISPLAY_MAP.get(p[8] if len(p) > 8 else 0,
+                                        f"Code {p[8] if len(p) > 8 else 0}"),
+        "in_menu":      (p[8] if len(p) > 8 else 0) not in DISPLAY_TEMP_OK,
+        "raw_payload":  list(p),                  # ← umbenannt von "raw" → "raw_payload"
     }
 
 
@@ -198,7 +236,6 @@ def _decode_ca(raw: bytes) -> dict | None:
 
 
 def _rgb_to_hs(r: int, g: int, b: int) -> tuple[float, float]:
-    """Minimal RGB → (Hue 0-360, Saturation 0-100) ohne externe Libs."""
     r_, g_, b_ = r / 255.0, g / 255.0, b / 255.0
     cmax  = max(r_, g_, b_)
     cmin  = min(r_, g_, b_)
@@ -362,14 +399,12 @@ class SpaClient:
     # ── Senden ────────────────────────────────────────────────────
 
     async def _write_direct(self, packet: bytes) -> None:
-        """Direkt senden (Channel-Request, NACK, C6 – ohne CTS-Queue)."""
         if not self._writer:
             raise UpdateFailed("Keine Verbindung zum Spa")
         self._writer.write(packet)
         await self._writer.drain()
 
     async def _assign_channel(self) -> None:
-        """Bus-Kanal vom Spa anfordern (erforderlich für C6-Temperatur)."""
         await asyncio.sleep(0.5)
         await self._write_direct(_build_channel_request())
         try:
@@ -460,14 +495,15 @@ class SpaClient:
             snap = await self._status_snapshot()
             if not snap:
                 raise UpdateFailed("Kein Status vom Spa")
-            if abs(snap["set_temp"] - target) < 0.3:
+
+            # Bereits korrekt gesetzt? Nichts tun.
+            if snap.get("set_temp_raw") == raw_target:
+                _LOGGER.debug("Soll-Temp bereits auf %.1f °C – kein Befehl nötig", target)
                 return
 
             _LOGGER.debug(
                 "C6 Soll-Temp %.1f °C (raw=%s) auf Kanal 0x%02X",
-                target,
-                raw_target,
-                channel,
+                target, raw_target, channel,
             )
 
             for attempt in range(3):
@@ -479,13 +515,12 @@ class SpaClient:
                 while time.monotonic() < deadline:
                     cur = await self._status_snapshot()
                     if cur and (
-                        abs(cur["set_temp"] - target) < 0.3
-                        or cur["raw_d8"] == raw_target
+                        cur.get("set_temp_raw") == raw_target          # ← FIX: raw vergleichen
+                        or abs(cur.get("set_temp", 0) - target) < 0.3
                     ):
                         _LOGGER.info(
                             "Soll-Temperatur auf %.1f °C gesetzt (Versuch %s)",
-                            cur["set_temp"],
-                            attempt + 1,
+                            cur["set_temp"], attempt + 1,
                         )
                         return
                     await asyncio.sleep(0.1)
@@ -494,7 +529,7 @@ class SpaClient:
                 await asyncio.sleep(0.3)
 
             final = await self._status_snapshot()
-            got = final["set_temp"] if final else None
+            got = final.get("set_temp") if final else None
             raise UpdateFailed(
                 f"Soll-Temperatur konnte nicht auf {target:.1f} °C gesetzt werden "
                 f"(aktuell: {got} °C)"
