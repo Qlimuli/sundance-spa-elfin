@@ -139,8 +139,11 @@ def _build_nack(channel: int) -> bytes:
 
 
 def _build_c6_temp(target_temp: float, channel: int) -> bytes:
-    """Soll-Temperatur direkt setzen (raw = °C × 2)."""
+    """Soll-Temperatur direkt setzen für Sundance Cameo 880."""
+    # Auf 0.5°C Schritte runden (wie das Spa es erwartet)
+    target_temp = max(20.0, min(40.0, round(target_temp * 2) / 2.0))
     raw_temp = int(round(target_temp * 2)) & 0xFF
+    
     msg = bytearray(9)
     msg[0] = M_STARTEND
     msg[1] = 7
@@ -148,14 +151,13 @@ def _build_c6_temp(target_temp: float, channel: int) -> bytes:
     msg[3] = 0xBF
     msg[4] = MSG_SET_TEMP
     msg[5] = raw_temp
-    msg[6] = 0x00
+    msg[6] = 0x00                    # Flag-Byte (manche Modelle brauchen hier ggf. 0x01)
     msg[7] = _calc_cs(msg[1:7], 6)
     msg[8] = M_STARTEND
     return bytes(msg)
 
 
 def _decode_c4(raw: bytes) -> dict | None:
-    # ── ORIGINAL: unverändertes XOR-Decoding ────────────────────────────────
     d = _xormsg(raw[5:len(raw) - 2])
     if len(d) < 15:
         return None
@@ -333,9 +335,6 @@ class SpaClient:
                 continue
 
             if mtype == CLEAR_TO_SEND:
-                # FIX: auf CMD_CHANNEL UND dem zugewiesenen Kanal antworten,
-                # damit C6-Pakete (die auf dem assigned_channel gesendet werden)
-                # korrekt durch die CTS-Queue geschickt werden.
                 assigned = self._assigned_channel or CMD_CHANNEL
                 if channel == CMD_CHANNEL or channel == assigned:
                     self._cts_ch += 1
@@ -455,14 +454,10 @@ class SpaClient:
 
     async def set_temperature(self, target: float) -> None:
         """
-        Setzt Soll-Temperatur per C6-Befehl.
-
-        FIX: C6-Paket wird nun über die CTS-Queue gesendet (wie Button-Befehle),
-        nicht mehr per _write_direct. Dadurch wird das Paket nur innerhalb des
-        vom Spa gewährten Sende-Fensters (Clear-To-Send) übertragen, was der
-        Balboa-Protokollspezifikation entspricht und zuvor zur Ablehnung führte.
+        Setzt Soll-Temperatur per C6-Befehl für Sundance Cameo 880.
+        Verbesserte Robustheit, bessere Logging und 0.5°C-Schritte.
         """
-        target = max(20.0, min(40.0, target))
+        target = max(20.0, min(40.0, round(target * 2) / 2.0))
         raw_target = int(round(target * 2))
 
         async with self._cmd_lock:
@@ -470,46 +465,41 @@ class SpaClient:
             snap = await self._status_snapshot()
             if not snap:
                 raise UpdateFailed("Kein Status vom Spa")
-            if abs(snap["set_temp"] - target) < 0.3:
+
+            if abs(snap.get("set_temp", 0) - target) < 0.3:
+                _LOGGER.info("Temperatur bereits auf %.1f °C", target)
                 return
 
             _LOGGER.debug(
-                "C6 Soll-Temp %.1f °C (raw=%s) auf Kanal 0x%02X",
-                target,
-                raw_target,
-                channel,
+                "C6 Versuch: Ziel=%.1f°C (raw=0x%02X) auf Kanal 0x%02X",
+                target, raw_target, channel
             )
 
-            for attempt in range(3):
-                # FIX: _send_q statt _write_direct – Paket wartet auf nächstes CTS
+            for attempt in range(4):
                 pkt = _build_c6_temp(target, channel)
                 await self._send_q.put(pkt)
-                await self.wait_status(n=6, timeout=6.0)
+                await self.wait_status(n=8, timeout=8.0)
 
-                deadline = time.monotonic() + 8.0
+                deadline = time.monotonic() + 10.0
                 while time.monotonic() < deadline:
                     cur = await self._status_snapshot()
-                    if cur and (
-                        abs(cur["set_temp"] - target) < 0.3
-                        or cur["raw_d8"] == raw_target
-                    ):
+                    if cur and abs(cur.get("set_temp", 0) - target) < 0.4:
                         _LOGGER.info(
-                            "Soll-Temperatur auf %.1f °C gesetzt (Versuch %s)",
-                            cur["set_temp"],
-                            attempt + 1,
+                            "✅ Temperatur erfolgreich auf %.1f °C gesetzt (Versuch %d)",
+                            cur["set_temp"], attempt + 1
                         )
                         return
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.2)
 
-                # Kanal-Sync nach fehlgeschlagenem Versuch
+                _LOGGER.warning("C6 Versuch %d fehlgeschlagen (raw=0x%02X)", attempt+1, raw_target)
                 await self._write_direct(_build_nack(channel))
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.5)
 
             final = await self._status_snapshot()
-            got = final["set_temp"] if final else None
+            got = final.get("set_temp") if final else None
             raise UpdateFailed(
-                f"Soll-Temperatur konnte nicht auf {target:.1f} °C gesetzt werden "
-                f"(aktuell: {got} °C)"
+                f"Temperatur konnte nicht auf {target:.1f}°C gesetzt werden "
+                f"(aktuell: {got}°C, raw Ziel=0x{raw_target:02X})"
             )
 
 
