@@ -186,7 +186,7 @@ def _decode_c4(raw: bytes) -> dict | None:
         "circ":         bool(circ),
         "circ_manual":  bool((d[1] >> 7) & 1),
         "circ_running": bool((d[1] >> 5) & 1),
-        "blower":       bool(d[14] & 1),
+        "blower":       False,
         "display_val":  d[13],
         "display":      DISPLAY_MAP.get(d[13], f"Code {d[13]}"),
         "in_menu":      d[13] not in DISPLAY_TEMP_OK,

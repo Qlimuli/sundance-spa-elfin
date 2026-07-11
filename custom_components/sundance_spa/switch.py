@@ -95,6 +95,7 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
     ) -> None:
         super().__init__(coordinator)
         self._sw = sw
+        self._entry = entry
         self._attr_unique_id   = f"{entry.entry_id}_{sw.key}"
         self._attr_name        = sw.name
         self._attr_device_info = DeviceInfo(
@@ -103,6 +104,10 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
             manufacturer="Sundance / Balboa",
             model="RS485-TCP",
         )
+        # Blubber meldet keinen zuverlässigen RS485-Status – nur Toggle per Taste.
+        if sw.key == "blower":
+            self._attr_assumed_state = True
+            self._optimistic_on: bool | None = None
 
     @property
     def _status(self) -> dict | None:
@@ -116,6 +121,8 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
     def is_on(self) -> bool | None:
         if self._status is None:
             return None
+        if self._sw.key == "blower" and self._optimistic_on is not None:
+            return self._optimistic_on
         return self._sw.getter(self._status)
 
     @property
@@ -138,7 +145,18 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
             }
         return {}
 
+    async def _send_blower_toggle(self) -> None:
+        """Blubber-Taste einmal senden (physikalischer Toggle am Spa)."""
+        await self.coordinator.client.send_button(self._sw.button, self._sw.mtype)
+        await self.coordinator.client.wait_status(n=6, timeout=5.0)
+
     async def async_turn_on(self, **kwargs) -> None:
+        if self._sw.key == "blower":
+            await self._send_blower_toggle()
+            self._optimistic_on = True
+            self.async_write_ha_state()
+            await self.coordinator.async_request_refresh()
+            return
         if self.is_on:
             return
         await self.coordinator.client.send_button(self._sw.button, self._sw.mtype)
@@ -146,6 +164,12 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs) -> None:
+        if self._sw.key == "blower":
+            await self._send_blower_toggle()
+            self._optimistic_on = False
+            self.async_write_ha_state()
+            await self.coordinator.async_request_refresh()
+            return
         if not self.is_on:
             return
         await self.coordinator.client.send_button(self._sw.button, self._sw.mtype)
