@@ -19,6 +19,7 @@ from . import (
     BTN_ZIRK,
     BTN_CLEARRAY,
     BTN_BLOWER,
+    CC_REQ_ALT,
 )
 
 
@@ -30,6 +31,7 @@ class SpaSwitch:
     icon_off: str
     button:   int
     getter:   Callable[[dict], bool]
+    mtype:    int = 0xCC
 
 
 SWITCH_TYPES: list[SpaSwitch] = [
@@ -63,6 +65,7 @@ SWITCH_TYPES: list[SpaSwitch] = [
         icon_off="mdi:weather-windy-variant",
         button=BTN_BLOWER,
         getter=lambda s: s.get("blower", False),
+        mtype=CC_REQ_ALT,
     ),
 ]
 
@@ -131,20 +134,20 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
         if self._sw.key == "blower":
             raw = self._status.get("raw", [])
             return {
-                "blower_raw_field13": raw[13] if len(raw) > 13 else None,
+                "blower_raw_field14": raw[14] if len(raw) > 14 else None,
             }
         return {}
 
     async def async_turn_on(self, **kwargs) -> None:
         if self.is_on:
             return
-        await self.coordinator.client.send_button(self._sw.button)
+        await self.coordinator.client.send_button(self._sw.button, self._sw.mtype)
         await self.coordinator.client.wait_status(n=6, timeout=4.0)
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs) -> None:
         if not self.is_on:
             return
-        await self.coordinator.client.send_button(self._sw.button)
+        await self.coordinator.client.send_button(self._sw.button, self._sw.mtype)
         await self.coordinator.client.wait_status(n=6, timeout=4.0)
         await self.coordinator.async_request_refresh()

@@ -1,7 +1,7 @@
 {
   "domain": "sundance_spa",
   "name": "Sundance Spa Cameo 880 (RS485-TCP)",
-  "version": "1.1.0",
+  "version": "1.2.1",
   "documentation": "https://github.com/Qlimuli/v0-sundance-spa-elfin",
   "issue_tracker": "https://github.com/Qlimuli/v0-sundance-spa-elfin/issues",
   "dependencies": [],

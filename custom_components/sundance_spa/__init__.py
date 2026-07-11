@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
@@ -29,20 +28,30 @@ LIGHTS_UPDATE_ALT = 0x23
 CC_REQ            = 0xCC
 CMD_CHANNEL       = 0x10
 CH_BROADCAST      = 0xFE
-MSG_CHANNEL_REQ   = 0x01
+MSG_CHANNEL_REQ    = 0x01
 MSG_CHANNEL_ASSIGN = 0x02
-MSG_NACK          = 0x00
-MSG_SET_TEMP      = 0xC6
-CLIENT_TYPE_PANEL = 0x02
+MSG_CHANNEL_ACK    = 0x03
+CLIENT_CLEAR_TO_SEND = 0x00
+CLIENT_TYPE_PANEL  = 0x02
+CC_REQ_ALT         = 0x17
+
+DETECT_CHANNEL_CYCLES = 5
+CHECKS_BEFORE_RETRY   = 2
+NO_CHANGE_REQUESTED   = -1.0
+LIGHT_NO_CHANGE       = -1
 
 # ── Button-Codes ─────────────────────────────────────────────────────────────
-BTN_PUMP1       = 228
-BTN_PUMP2       = 229
-BTN_CLEARRAY    = 239
-BTN_LIGHT       = 241   # Licht An/Aus + Helligkeit-Stufe
-BTN_LIGHT_COLOR = 242   # Licht-Farbe / Effekt weiterschalten  ← NEU (war BTN_ZIRK)
-BTN_ZIRK        = 242   # Auto-Zirkulation  (gleicher Code! Kontext-abhängig)
-BTN_BLOWER      = 243   # Blubber / Luftsprudel
+BTN_TEMP_UP        = 225
+BTN_TEMP_DOWN      = 226
+BTN_TEMP_RANGE_LOW = 200
+BTN_TEMP_RANGE_HI  = 201
+BTN_PUMP1          = 228
+BTN_PUMP2          = 229
+BTN_CLEARRAY       = 239
+BTN_LIGHT          = 241
+BTN_LIGHT_COLOR    = 242
+BTN_ZIRK           = 242
+BTN_BLOWER         = 243
 
 # ── Lookup-Tabellen ──────────────────────────────────────────────────────────
 HEAT_MODE_MAP = {32: "AUTO", 34: "ECO", 36: "DAY"}
@@ -65,6 +74,8 @@ LIGHT_MODE_MAP = {
       2: "Blue",  7: "Violet", 6: "Red",   8: "Amber",
       3: "Green", 9: "Aqua",   1: "White", 0: "Off",
 }
+
+LIGHT_MODE_BY_NAME = {name: code for code, name in LIGHT_MODE_MAP.items()}
 
 DISPLAY_TEMP_OK = {22, 23, 30, 31, 32, 36}
 
@@ -95,14 +106,14 @@ def _xormsg(data: bytes | bytearray) -> list[int]:
     return result
 
 
-def _build_cc(btn: int, channel: int = CMD_CHANNEL) -> bytes:
+def _build_cc(btn: int, channel: int = CMD_CHANNEL, mtype: int = CC_REQ) -> bytes:
     ml  = 7
     msg = bytearray(9)
     msg[0] = M_STARTEND
     msg[1] = ml
     msg[2] = channel
     msg[3] = 0xBF
-    msg[4] = CC_REQ
+    msg[4] = mtype
     msg[5] = btn & 0xFF
     msg[6] = 0
     msg[7] = _calc_cs(msg[1:ml], ml - 1)
@@ -111,47 +122,50 @@ def _build_cc(btn: int, channel: int = CMD_CHANNEL) -> bytes:
 
 
 def _build_channel_request() -> bytes:
-    """Channel-Assignment auf Broadcast 0xFE (Sundance Cameo / Balboa)."""
-    msg = bytearray(8)
+    """Channel-Assignment auf Broadcast 0xFE (Sundance / Balboa RS485)."""
+    msg = bytearray(10)
     msg[0] = M_STARTEND
-    msg[1] = 6
+    msg[1] = 8
     msg[2] = CH_BROADCAST
     msg[3] = 0xBF
     msg[4] = MSG_CHANNEL_REQ
     msg[5] = CLIENT_TYPE_PANEL
-    msg[6] = _calc_cs(msg[1:6], 5)
-    msg[7] = M_STARTEND
+    msg[6] = 0xF1
+    msg[7] = 0x73
+    msg[8] = _calc_cs(msg[1:8], 7)
+    msg[9] = M_STARTEND
     return bytes(msg)
 
 
-def _build_nack(channel: int) -> bytes:
-    """Bereitschaft auf zugewiesenem Kanal signalisieren."""
-    msg = bytearray(8)
+def _build_channel_ack(channel: int) -> bytes:
+    """Kanal-Zuweisung bestätigen (0x03)."""
+    msg = bytearray(7)
     msg[0] = M_STARTEND
-    msg[1] = 6
+    msg[1] = 5
     msg[2] = channel
     msg[3] = 0xBF
-    msg[4] = MSG_NACK
-    msg[5] = 0x00
-    msg[6] = _calc_cs(msg[1:6], 5)
-    msg[7] = M_STARTEND
+    msg[4] = MSG_CHANNEL_ACK
+    msg[5] = _calc_cs(msg[1:5], 4)
+    msg[6] = M_STARTEND
     return bytes(msg)
 
 
-def _build_c6_temp(target_temp: float, channel: int) -> bytes:
-    """Soll-Temperatur direkt setzen (raw = °C × 2)."""
-    raw_temp = int(round(target_temp * 2)) & 0xFF
-    msg = bytearray(9)
-    msg[0] = M_STARTEND
-    msg[1] = 7
-    msg[2] = channel
-    msg[3] = 0xBF
-    msg[4] = MSG_SET_TEMP
-    msg[5] = raw_temp
-    msg[6] = 0x00
-    msg[7] = _calc_cs(msg[1:7], 6)
-    msg[8] = M_STARTEND
-    return bytes(msg)
+def _decode_set_temp(raw: int, _celsius_scale: bool) -> float:
+    """Soll-Temperatur dekodieren (Cameo 880: niedrige Werte = °C×2, hohe = °F)."""
+    if raw >= 80:
+        return round((raw - 32) * 5 / 9, 1)
+    return raw / 2.0
+
+
+def _brightness_step(level_pct: int) -> int:
+    """Spa-Helligkeitsstufen (0 / 33 / 66 / 100)."""
+    if level_pct <= 0:
+        return 0
+    if level_pct < 50:
+        return 33
+    if level_pct < 83:
+        return 66
+    return 100
 
 
 def _decode_c4(raw: bytes) -> dict | None:
@@ -159,10 +173,12 @@ def _decode_c4(raw: bytes) -> dict | None:
     if len(d) < 15:
         return None
     circ = (d[1] >> 6) & 1
+    celsius_scale = bool(d[9] & 0x01) if len(d) > 9 else True
+    set_raw = d[8]
     return {
         "time":         f"{d[0] ^ 6:02d}:{d[11]:02d}",
         "cur_temp":     (d[5] ^ 2) / 2.0 if (d[5] ^ 2) != 255 else None,
-        "set_temp":     d[8] / 2.0,
+        "set_temp":     _decode_set_temp(set_raw, celsius_scale),
         "heat_active":  bool((d[10] >> 6) & 1),
         "heat_mode":    HEAT_MODE_MAP.get(d[6], f"0x{d[6]:02X}"),
         "pump1":        bool((d[2] >> 4) & 1),
@@ -170,13 +186,12 @@ def _decode_c4(raw: bytes) -> dict | None:
         "circ":         bool(circ),
         "circ_manual":  bool((d[1] >> 7) & 1),
         "circ_running": bool((d[1] >> 5) & 1),
-        # Blower/Blubber: Feld 13, Bits 2-3 (Balboa Standard)
-        # Falls der Wert immer 0 ist → Button-Code per Sniffing bestimmen
-        "blower":       bool((d[13] >> 2) & 0x03),
+        "blower":       bool(d[14] & 1),
         "display_val":  d[13],
         "display":      DISPLAY_MAP.get(d[13], f"Code {d[13]}"),
         "in_menu":      d[13] not in DISPLAY_TEMP_OK,
-        "raw_d8":       d[8],
+        "celsius_scale": celsius_scale,
+        "raw_d8":       set_raw,
         "raw":          list(d),
     }
 
@@ -225,42 +240,66 @@ class SpaClient:
         self.port = port
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
-        self._send_q: asyncio.Queue = asyncio.Queue()
+        self._pending: list[tuple[int, bytes]] = []
+        self._pending_lock = asyncio.Lock()
         self._recv_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._status: dict | None = None
-        self._lights:  dict | None = None
+        self._lights: dict | None = None
         self._status_seq = 0
-        self._lights_seq  = 0
-        self._cts_ch = 0
+        self._lights_seq = 0
         self._connected = False
         self._lock = asyncio.Lock()
         self._cmd_lock = asyncio.Lock()
         self._assigned_channel: int | None = None
-        self._channel_assigned = asyncio.Event()
-
-    # ── Verbindung ────────────────────────────────────────────────
+        self._channel_ready = asyncio.Event()
+        self._discovered_channels: list[int] = []
+        self._active_channels: list[int] = []
+        self._detect_state = 0
+        self._target_temp = NO_CHANGE_REQUESTED
+        self._temp_done = asyncio.Event()
+        self._temp_check = 0
+        self._target_light_brightness = LIGHT_NO_CHANGE
+        self._target_light_mode = LIGHT_NO_CHANGE
+        self._light_done = asyncio.Event()
+        self._light_check = 0
 
     async def connect(self) -> None:
         self._reader, self._writer = await asyncio.open_connection(
             self.host, self.port
         )
         import socket as _s
+
         sock = self._writer.transport.get_extra_info("socket")
         if sock:
             sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_NODELAY, 1)
         self._stop.clear()
         self._connected = True
-        self._assigned_channel = None
-        self._channel_assigned = asyncio.Event()
+        self._reset_channel_state()
         self._recv_task = asyncio.create_task(self._receiver())
-        await self._assign_channel()
+        await self._write_direct(_build_channel_request())
+        try:
+            await asyncio.wait_for(self._channel_ready.wait(), timeout=12.0)
+        except asyncio.TimeoutError:
+            self._assigned_channel = CMD_CHANNEL
+            self._channel_ready.set()
+            _LOGGER.warning(
+                "Kein Channel-Assignment – Fallback auf 0x%02X", CMD_CHANNEL
+            )
         _LOGGER.info(
             "Spa verbunden: %s:%s (Kanal 0x%02X)",
             self.host,
             self.port,
             self._assigned_channel or 0,
         )
+
+    def _reset_channel_state(self) -> None:
+        self._assigned_channel = None
+        self._channel_ready = asyncio.Event()
+        self._discovered_channels = []
+        self._active_channels = []
+        self._detect_state = 0
+        self._pending = []
 
     async def disconnect(self) -> None:
         self._connected = False
@@ -277,8 +316,6 @@ class SpaClient:
                 await self._writer.wait_closed()
             except Exception:
                 pass
-
-    # ── Empfänger ─────────────────────────────────────────────────
 
     async def _read_msg(self) -> bytes | None:
         assert self._reader is not None
@@ -307,43 +344,41 @@ class SpaClient:
         assert self._writer is not None
         while not self._stop.is_set():
             msg = await self._read_msg()
-            if msg is None:
+            if msg is None or len(msg) < 5:
                 continue
-            if len(msg) < 5:
-                continue
-            mtype   = msg[4]
+            mtype = msg[4]
             channel = msg[2]
 
             if mtype == MSG_CHANNEL_ASSIGN and len(msg) >= 7:
                 assigned = msg[5]
                 self._assigned_channel = assigned
-                self._channel_assigned.set()
+                self._channel_ready.set()
                 _LOGGER.info("Spa-Kanal zugewiesen: 0x%02X", assigned)
+                await self._write_direct(_build_channel_ack(assigned))
                 continue
 
-            if mtype == MSG_CHANNEL_REQ and len(msg) >= 7:
-                ch = msg[2]
-                if ch not in (CH_BROADCAST, 0xFF):
-                    self._assigned_channel = ch
-                    self._channel_assigned.set()
-                    _LOGGER.info("Spa-Kanal aus Antwort 0x01: 0x%02X", ch)
-                continue
-
-            if mtype == MSG_SET_TEMP:
-                _LOGGER.debug("C6-Antwort empfangen: %s", msg.hex())
-                continue
+            if (
+                mtype == CLIENT_CLEAR_TO_SEND
+                and self._assigned_channel is None
+                and self._detect_state >= DETECT_CHANNEL_CYCLES
+            ):
+                await self._write_direct(_build_channel_request())
 
             if mtype == CLEAR_TO_SEND:
-                if channel == CMD_CHANNEL:
-                    self._cts_ch += 1
-                    if not self._send_q.empty():
-                        try:
-                            pkt = self._send_q.get_nowait()
-                            self._writer.write(pkt)
-                            await self._writer.drain()
-                        except Exception as exc:
-                            _LOGGER.debug("TX-Fehler: %s", exc)
+                if channel not in self._discovered_channels:
+                    self._discovered_channels.append(channel)
+                await self._flush_pending(channel)
+                if self._detect_state < DETECT_CHANNEL_CYCLES:
+                    self._detect_state += 1
+                if (
+                    self._assigned_channel is None
+                    and self._detect_state >= DETECT_CHANNEL_CYCLES
+                ):
+                    self._pick_idle_channel()
                 continue
+
+            if mtype in (CC_REQ, CC_REQ_ALT) and channel not in self._active_channels:
+                self._active_channels.append(channel)
 
             if mtype in (STATUS_UPDATE, STATUS_UPDATE_ALT):
                 dec = _decode_c4(msg)
@@ -351,6 +386,7 @@ class SpaClient:
                     async with self._lock:
                         self._status = dec
                         self._status_seq += 1
+                    await self._handle_temp_feedback(dec)
 
             elif mtype in (LIGHTS_UPDATE, LIGHTS_UPDATE_ALT):
                 dec = _decode_ca(msg)
@@ -358,36 +394,87 @@ class SpaClient:
                     async with self._lock:
                         self._lights = dec
                         self._lights_seq += 1
+                    await self._handle_light_feedback(dec)
 
-    # ── Senden ────────────────────────────────────────────────────
+    def _pick_idle_channel(self) -> None:
+        for ch in sorted(self._discovered_channels):
+            if ch not in self._active_channels:
+                self._assigned_channel = ch
+                self._channel_ready.set()
+                _LOGGER.info("Freien Bus-Kanal gewählt: 0x%02X", ch)
+                return
+
+    async def _flush_pending(self, channel: int) -> None:
+        assert self._writer is not None
+        async with self._pending_lock:
+            for idx, (pkt_ch, pkt) in enumerate(self._pending):
+                if pkt_ch == channel:
+                    self._writer.write(pkt)
+                    await self._writer.drain()
+                    self._pending.pop(idx)
+                    return
 
     async def _write_direct(self, packet: bytes) -> None:
-        """Direkt senden (Channel-Request, NACK, C6 – ohne CTS-Queue)."""
         if not self._writer:
             raise UpdateFailed("Keine Verbindung zum Spa")
         self._writer.write(packet)
         await self._writer.drain()
 
-    async def _assign_channel(self) -> None:
-        """Bus-Kanal vom Spa anfordern (erforderlich für C6-Temperatur)."""
-        await asyncio.sleep(0.5)
-        await self._write_direct(_build_channel_request())
-        try:
-            await asyncio.wait_for(self._channel_assigned.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            self._assigned_channel = CMD_CHANNEL
-            _LOGGER.warning(
-                "Kein Channel-Assignment – Fallback auf 0x%02X", CMD_CHANNEL
-            )
-        ch = self._assigned_channel or CMD_CHANNEL
-        self._assigned_channel = ch
-        await self._write_direct(_build_nack(ch))
-        await asyncio.sleep(0.3)
+    async def _queue_cc(self, btn: int, mtype: int = CC_REQ) -> None:
+        await self._ensure_channel()
+        # Sundance Cameo / Balboa: CTS auf 0x10, Pumpen funktionieren dort zuverlässig.
+        ch = CMD_CHANNEL
+        async with self._pending_lock:
+            self._pending.append((ch, _build_cc(btn, ch, mtype)))
 
-    async def send_button(self, btn: int) -> None:
-        await self._send_q.put(_build_cc(btn))
+    async def _handle_temp_feedback(self, status: dict) -> None:
+        if self._temp_check > 0:
+            self._temp_check -= 1
+        if self._temp_check > 0 or self._target_temp == NO_CHANGE_REQUESTED:
+            return
 
-    # ── Warte-Helfer ──────────────────────────────────────────────
+        current = status["set_temp"]
+        if abs(current - self._target_temp) < 0.3:
+            self._target_temp = NO_CHANGE_REQUESTED
+            self._temp_done.set()
+            _LOGGER.info("Soll-Temperatur erreicht: %.1f °C", current)
+            return
+
+        btn = BTN_TEMP_DOWN if self._target_temp < current else BTN_TEMP_UP
+        await self._queue_cc(btn)
+        self._temp_check = CHECKS_BEFORE_RETRY
+
+    async def _handle_light_feedback(self, lights: dict) -> None:
+        if self._light_check > 0:
+            self._light_check -= 1
+        if self._light_check > 0:
+            return
+
+        if self._target_light_mode != LIGHT_NO_CHANGE:
+            if lights["mode_raw"] == self._target_light_mode:
+                self._target_light_mode = LIGHT_NO_CHANGE
+                self._light_done.set()
+            elif lights["brightness_raw"] == 0:
+                await self._queue_cc(BTN_LIGHT)
+                self._light_check = CHECKS_BEFORE_RETRY
+            else:
+                await self._queue_cc(BTN_LIGHT_COLOR)
+                self._light_check = CHECKS_BEFORE_RETRY
+            return
+
+        if self._target_light_brightness == LIGHT_NO_CHANGE:
+            return
+
+        if lights["brightness_raw"] == self._target_light_brightness:
+            self._target_light_brightness = LIGHT_NO_CHANGE
+            self._light_done.set()
+            return
+
+        await self._queue_cc(BTN_LIGHT)
+        self._light_check = CHECKS_BEFORE_RETRY
+
+    async def send_button(self, btn: int, mtype: int = CC_REQ) -> None:
+        await self._queue_cc(btn, mtype)
 
     async def wait_status(self, n: int = 6, timeout: float = 4.0) -> bool:
         start = self._status_seq
@@ -418,8 +505,6 @@ class SpaClient:
             elapsed += 0.2
         return False
 
-    # ── Datenzugriff ─────────────────────────────────────────────
-
     @property
     def status(self) -> dict | None:
         return self._status
@@ -436,69 +521,132 @@ class SpaClient:
     def assigned_channel(self) -> int | None:
         return self._assigned_channel
 
-    # ── Status-Helfer ─────────────────────────────────────────────
-
     async def _status_snapshot(self) -> dict | None:
         async with self._lock:
             return dict(self._status) if self._status else None
 
+    async def _lights_snapshot(self) -> dict | None:
+        async with self._lock:
+            return dict(self._lights) if self._lights else None
+
     async def _ensure_channel(self) -> int:
         if self._assigned_channel is not None:
             return self._assigned_channel
-        await self._assign_channel()
+        try:
+            await asyncio.wait_for(self._channel_ready.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            self._assigned_channel = CMD_CHANNEL
         return self._assigned_channel or CMD_CHANNEL
 
-    # ── Temperatur setzen (C6 + Channel-Assignment) ───────────────
+    async def _ensure_temp_range(self, target: float, current_raw: int) -> None:
+        """Cameo 880: Temperaturbereich (Low/High) vor Feineinstellung umschalten."""
+        high_range = current_raw >= 80
+        want_high = target >= 37.0
+        if high_range != want_high:
+            await self._queue_cc(BTN_TEMP_RANGE_HI if want_high else BTN_TEMP_RANGE_LOW)
+            self._temp_check = CHECKS_BEFORE_RETRY
+
+    async def _ensure_pumps_off_for_heating(self) -> None:
+        """Cameo 880 (40A): Temperaturänderung nur bei ausgeschalteten Jet-Pumpen."""
+        for _ in range(6):
+            snap = await self._status_snapshot()
+            if not snap:
+                return
+            if not snap["pump1"] and not snap["pump2"]:
+                return
+            if snap["pump1"]:
+                await self._queue_cc(BTN_PUMP1)
+            if snap["pump2"]:
+                await self._queue_cc(BTN_PUMP2)
+            await asyncio.sleep(1.5)
 
     async def set_temperature(self, target: float) -> None:
-        """Setzt Soll-Temperatur per C6-Befehl auf dem zugewiesenen Kanal."""
+        """Soll-Temperatur per Warmer/Cooler-Tasten (Feedback-Schleife)."""
         target = max(20.0, min(40.0, target))
-        raw_target = int(round(target * 2))
-
         async with self._cmd_lock:
-            channel = await self._ensure_channel()
             snap = await self._status_snapshot()
             if not snap:
                 raise UpdateFailed("Kein Status vom Spa")
             if abs(snap["set_temp"] - target) < 0.3:
                 return
 
+            await self._ensure_channel()
+            await self._ensure_pumps_off_for_heating()
+            await self._ensure_temp_range(target, snap["raw_d8"])
+            self._temp_done.clear()
+            self._temp_check = 0
+            self._target_temp = target
             _LOGGER.debug(
-                "C6 Soll-Temp %.1f °C (raw=%s) auf Kanal 0x%02X",
+                "Ziel-Temperatur %.1f °C (aktuell %.1f °C, raw=%s)",
                 target,
-                raw_target,
-                channel,
+                snap["set_temp"],
+                snap["raw_d8"],
             )
+            await self._handle_temp_feedback(snap)
 
-            for attempt in range(3):
-                pkt = _build_c6_temp(target, channel)
-                await self._write_direct(pkt)
-                await self.wait_status(n=6, timeout=6.0)
+            try:
+                await asyncio.wait_for(self._temp_done.wait(), timeout=120.0)
+            except asyncio.TimeoutError as exc:
+                final = await self._status_snapshot()
+                got = final["set_temp"] if final else None
+                raise UpdateFailed(
+                    f"Soll-Temperatur konnte nicht auf {target:.1f} °C gesetzt werden "
+                    f"(aktuell: {got} °C). Prüfen Sie ggf. die Temperatur-Sperre am Panel."
+                ) from exc
+            finally:
+                self._target_temp = NO_CHANGE_REQUESTED
 
-                deadline = time.monotonic() + 8.0
-                while time.monotonic() < deadline:
-                    cur = await self._status_snapshot()
-                    if cur and (
-                        abs(cur["set_temp"] - target) < 0.3
-                        or cur["raw_d8"] == raw_target
-                    ):
-                        _LOGGER.info(
-                            "Soll-Temperatur auf %.1f °C gesetzt (Versuch %s)",
-                            cur["set_temp"],
-                            attempt + 1,
-                        )
-                        return
-                    await asyncio.sleep(0.1)
+    async def set_light(
+        self,
+        *,
+        on: bool | None = None,
+        brightness_pct: int | None = None,
+        effect: str | None = None,
+    ) -> None:
+        """Licht steuern mit Retry/Feedback wie im Sundance-RS485-Referenzprojekt."""
+        async with self._cmd_lock:
+            await self._ensure_channel()
+            self._light_done.clear()
+            self._light_check = 0
+            self._target_light_mode = LIGHT_NO_CHANGE
+            self._target_light_brightness = LIGHT_NO_CHANGE
 
-                await self._write_direct(_build_nack(channel))
-                await asyncio.sleep(0.3)
+            if effect is not None:
+                mode = LIGHT_MODE_BY_NAME.get(effect)
+                if mode is None:
+                    raise UpdateFailed(f"Unbekannter Licht-Effekt: {effect}")
+                lights = await self._lights_snapshot()
+                if not lights or lights["brightness_raw"] == 0:
+                    self._target_light_brightness = 100
+                    try:
+                        await asyncio.wait_for(self._light_done.wait(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        raise UpdateFailed("Licht konnte nicht eingeschaltet werden")
+                    self._light_done.clear()
+                    self._light_check = 0
+                self._target_light_mode = mode
+            elif on is False or (brightness_pct is not None and brightness_pct <= 0):
+                self._target_light_brightness = 0
+            elif brightness_pct is not None:
+                self._target_light_brightness = _brightness_step(brightness_pct)
+            elif on is True:
+                self._target_light_brightness = 100
+            else:
+                return
 
-            final = await self._status_snapshot()
-            got = final["set_temp"] if final else None
-            raise UpdateFailed(
-                f"Soll-Temperatur konnte nicht auf {target:.1f} °C gesetzt werden "
-                f"(aktuell: {got} °C)"
-            )
+            lights = await self._lights_snapshot()
+            if lights:
+                await self._handle_light_feedback(lights)
+
+            try:
+                await asyncio.wait_for(self._light_done.wait(), timeout=60.0)
+            except asyncio.TimeoutError as exc:
+                lights = await self._lights_snapshot()
+                state = "an" if lights and lights.get("on") else "aus"
+                raise UpdateFailed(f"Licht-Zielzustand nicht erreicht (aktuell {state})") from exc
+            finally:
+                self._target_light_brightness = LIGHT_NO_CHANGE
+                self._target_light_mode = LIGHT_NO_CHANGE
 
 
 # ── DataUpdateCoordinator ────────────────────────────────────────────────────
