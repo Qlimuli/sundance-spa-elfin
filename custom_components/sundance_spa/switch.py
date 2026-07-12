@@ -20,6 +20,7 @@ from . import (
     BTN_CLEARRAY,
     BTN_BLOWER,
     CC_REQ_ALT,
+    _agent_debug_log,
 )
 
 
@@ -147,11 +148,35 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
 
     async def _send_blower_toggle(self) -> None:
         """Blubber-Taste einmal senden (physikalischer Toggle am Spa)."""
+        # #region agent log
+        _agent_debug_log(
+            "switch.py:_send_blower_toggle",
+            "before_send",
+            {"button": self._sw.button, "mtype": self._sw.mtype},
+            "H1",
+        )
+        # #endregion
         await self.coordinator.client.send_button(self._sw.button, self._sw.mtype)
         await self.coordinator.client.wait_status(n=6, timeout=5.0)
+        # #region agent log
+        _agent_debug_log(
+            "switch.py:_send_blower_toggle",
+            "after_wait",
+            {"button": self._sw.button, "mtype": self._sw.mtype},
+            "H1",
+        )
+        # #endregion
 
     async def async_turn_on(self, **kwargs) -> None:
         if self._sw.key == "blower":
+            # #region agent log
+            _agent_debug_log(
+                "switch.py:async_turn_on",
+                "blower_turn_on",
+                {"optimistic_on": self._optimistic_on},
+                "H1",
+            )
+            # #endregion
             await self._send_blower_toggle()
             self._optimistic_on = True
             self.async_write_ha_state()
@@ -165,6 +190,14 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         if self._sw.key == "blower":
+            # #region agent log
+            _agent_debug_log(
+                "switch.py:async_turn_off",
+                "blower_turn_off",
+                {"optimistic_on": self._optimistic_on},
+                "H1",
+            )
+            # #endregion
             await self._send_blower_toggle()
             self._optimistic_on = False
             self.async_write_ha_state()

@@ -5,8 +5,11 @@ Protokoll-Engine + DataUpdateCoordinator in einer Datei.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 from datetime import timedelta
+from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT, Platform
@@ -14,6 +17,40 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 _LOGGER = logging.getLogger(__name__)
+
+# #region agent log
+def _agent_debug_log(
+    location: str,
+    message: str,
+    data: dict,
+    hypothesis_id: str,
+    run_id: str = "pre-fix",
+) -> None:
+    payload = {
+        "sessionId": "b00787",
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    here = Path(__file__).resolve().parent
+    for log_path in (
+        here / "debug-b00787.log",
+        here.parents[2] / "debug-b00787.log" if len(here.parents) > 2 else None,
+        Path("/config") / "debug-b00787.log",
+    ):
+        if log_path is None:
+            continue
+        try:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass
+    _LOGGER.info("AGENTDBG [%s] %s %s", hypothesis_id, message, data)
+# #endregion
 
 DOMAIN = "sundance_spa"
 PLATFORMS = [Platform.CLIMATE, Platform.SWITCH, Platform.LIGHT, Platform.SENSOR]
@@ -367,6 +404,19 @@ class SpaClient:
             if mtype == CLEAR_TO_SEND:
                 if channel not in self._discovered_channels:
                     self._discovered_channels.append(channel)
+                # #region agent log
+                if self._pending:
+                    _agent_debug_log(
+                        "__init__.py:_receiver:CTS",
+                        "clear_to_send",
+                        {
+                            "channel": channel,
+                            "pending_len": len(self._pending),
+                            "pending_channels": [p[0] for p in self._pending],
+                        },
+                        "H2",
+                    )
+                # #endregion
                 await self._flush_pending(channel)
                 if self._detect_state < DETECT_CHANNEL_CYCLES:
                     self._detect_state += 1
@@ -412,7 +462,28 @@ class SpaClient:
                     self._writer.write(pkt)
                     await self._writer.drain()
                     self._pending.pop(idx)
+                    # #region agent log
+                    _agent_debug_log(
+                        "__init__.py:_flush_pending",
+                        "packet_sent",
+                        {
+                            "channel": channel,
+                            "btn": pkt[5] if len(pkt) > 5 else None,
+                            "mtype": pkt[4] if len(pkt) > 4 else None,
+                            "pending_after": len(self._pending),
+                        },
+                        "H2",
+                    )
+                    # #endregion
                     return
+            # #region agent log
+            _agent_debug_log(
+                "__init__.py:_flush_pending",
+                "no_match",
+                {"channel": channel, "pending": [(p[0], p[1][5], p[1][4]) for p in self._pending]},
+                "H2",
+            )
+            # #endregion
 
     async def _write_direct(self, packet: bytes) -> None:
         if not self._writer:
@@ -426,6 +497,15 @@ class SpaClient:
         ch = CMD_CHANNEL
         async with self._pending_lock:
             self._pending.append((ch, _build_cc(btn, ch, mtype)))
+            pending_len = len(self._pending)
+        # #region agent log
+        _agent_debug_log(
+            "__init__.py:_queue_cc",
+            "queued",
+            {"btn": btn, "mtype": mtype, "channel": ch, "pending_len": pending_len},
+            "H3",
+        )
+        # #endregion
 
     async def _handle_temp_feedback(self, status: dict) -> None:
         if self._temp_check > 0:
@@ -474,6 +554,14 @@ class SpaClient:
         self._light_check = CHECKS_BEFORE_RETRY
 
     async def send_button(self, btn: int, mtype: int = CC_REQ) -> None:
+        # #region agent log
+        _agent_debug_log(
+            "__init__.py:send_button",
+            "called",
+            {"btn": btn, "mtype": mtype, "connected": self._connected},
+            "H3",
+        )
+        # #endregion
         await self._queue_cc(btn, mtype)
 
     async def wait_status(self, n: int = 6, timeout: float = 4.0) -> bool:
