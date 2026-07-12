@@ -5,8 +5,11 @@ Protokoll-Engine + DataUpdateCoordinator in einer Datei.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 from datetime import timedelta
+from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT, Platform
@@ -14,6 +17,25 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 _LOGGER = logging.getLogger(__name__)
+
+# #region agent log
+def _agent_debug_log(
+    location: str, message: str, data: dict, hypothesis_id: str, run_id: str = "temp-debug",
+) -> None:
+    payload = {
+        "sessionId": "b00787", "runId": run_id, "hypothesisId": hypothesis_id,
+        "location": location, "message": message, "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    here = Path(__file__).resolve().parent
+    for log_path in (here / "debug-b00787.log", here.parents[2] / "debug-b00787.log"):
+        try:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass
+# #endregion
 
 DOMAIN = "sundance_spa"
 PLATFORMS = [Platform.CLIMATE, Platform.SWITCH, Platform.LIGHT, Platform.SENSOR]
@@ -130,6 +152,16 @@ def _build_cc(
 BLOWER_CC_BTN = 53
 BLOWER_CC_B6  = 217
 BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
+
+# Cameo 880: Temperatur Warmer/Cooler = verschlüsseltes Panel-CC (nicht Klartext 225/226).
+# Hunt-Scan: Klartext 225/226 wirkungslos; 0/227 senkt Soll-Temp; 19/243 Kandidat Warmer.
+TEMP_UP_CC_BTN   = 19
+TEMP_UP_CC_B6    = 243
+TEMP_DOWN_CC_BTN = 0
+TEMP_DOWN_CC_B6  = 227
+# Panel-Sniff: Range High = 141/69 (decoded 201)
+TEMP_RANGE_HI_CC_BTN = 141
+TEMP_RANGE_HI_CC_B6  = 69
 
 
 def _build_channel_request() -> bytes:
@@ -442,6 +474,13 @@ class SpaClient:
         """Blubber ein/aus – verschlüsseltes Panel-CC (53/217)."""
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
+    async def _send_temp_step(self, warmer: bool) -> None:
+        """Soll-Temperatur ±0.5 °C per verschlüsseltem Panel-CC."""
+        if warmer:
+            await self._queue_cc(TEMP_UP_CC_BTN, CC_REQ, TEMP_UP_CC_B6)
+        else:
+            await self._queue_cc(TEMP_DOWN_CC_BTN, CC_REQ, TEMP_DOWN_CC_B6)
+
     async def _handle_temp_feedback(self, status: dict) -> None:
         if self._temp_check > 0:
             self._temp_check -= 1
@@ -455,8 +494,27 @@ class SpaClient:
             _LOGGER.info("Soll-Temperatur erreicht: %.1f °C", current)
             return
 
-        btn = BTN_TEMP_DOWN if self._target_temp < current else BTN_TEMP_UP
-        await self._queue_cc(btn)
+        warmer = self._target_temp > current
+        # #region agent log
+        _agent_debug_log(
+            "__init__.py:_handle_temp_feedback",
+            "press",
+            {
+                "warmer": warmer,
+                "panel_cc": (
+                    f"{TEMP_UP_CC_BTN}/{TEMP_UP_CC_B6}"
+                    if warmer
+                    else f"{TEMP_DOWN_CC_BTN}/{TEMP_DOWN_CC_B6}"
+                ),
+                "current": current,
+                "target": self._target_temp,
+                "raw_d8": status.get("raw_d8"),
+            },
+            "H23",
+            run_id="post-fix",
+        )
+        # #endregion
+        await self._send_temp_step(warmer)
         self._temp_check = CHECKS_BEFORE_RETRY
 
     async def _handle_light_feedback(self, lights: dict) -> None:
@@ -558,7 +616,12 @@ class SpaClient:
         high_range = current_raw >= 80
         want_high = target >= 37.0
         if high_range != want_high:
-            await self._queue_cc(BTN_TEMP_RANGE_HI if want_high else BTN_TEMP_RANGE_LOW)
+            if want_high:
+                await self._queue_cc(
+                    TEMP_RANGE_HI_CC_BTN, CC_REQ, TEMP_RANGE_HI_CC_B6
+                )
+            else:
+                await self._queue_cc(BTN_TEMP_RANGE_LOW)
             self._temp_check = CHECKS_BEFORE_RETRY
 
     async def _ensure_pumps_off_for_heating(self) -> None:
@@ -591,6 +654,24 @@ class SpaClient:
             self._temp_done.clear()
             self._temp_check = 0
             self._target_temp = target
+            # #region agent log
+            _agent_debug_log(
+                "__init__.py:set_temperature",
+                "start",
+                {
+                    "target": target,
+                    "current": snap["set_temp"],
+                    "raw_d8": snap["raw_d8"],
+                    "p1": snap["pump1"],
+                    "p2": snap["pump2"],
+                    "in_menu": snap.get("in_menu"),
+                    "temp_up_cc": f"{TEMP_UP_CC_BTN}/{TEMP_UP_CC_B6}",
+                    "temp_down_cc": f"{TEMP_DOWN_CC_BTN}/{TEMP_DOWN_CC_B6}",
+                },
+                "H23",
+                run_id="post-fix",
+            )
+            # #endregion
             _LOGGER.debug(
                 "Ziel-Temperatur %.1f °C (aktuell %.1f °C, raw=%s)",
                 target,
