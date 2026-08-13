@@ -66,6 +66,19 @@ LIGHT_NO_CHANGE       = -1
 MAX_COMMAND_ATTEMPTS  = 16  # Bus nicht fluten (sonst Touch-Panel träge)
 MAX_PENDING_CC        = 2   # max. wartende CC-Pakete – verhindert Bus-Überlastung
 
+# ── Button-Codes ─────────────────────────────────────────────────────────────
+BTN_TEMP_UP        = 225
+BTN_TEMP_DOWN      = 226
+BTN_TEMP_RANGE_LOW = 200
+BTN_TEMP_RANGE_HI  = 201
+BTN_PUMP1          = 228
+BTN_PUMP2          = 229
+BTN_CLEARRAY       = 239
+BTN_LIGHT          = 241
+BTN_LIGHT_COLOR    = 242
+BTN_ZIRK           = 242
+BTN_BLOWER         = 237   # Klartext NICHT verwenden – steuert Pumpen; siehe BLOWER_CC_*
+
 # ── Lookup-Tabellen ──────────────────────────────────────────────────────────
 HEAT_MODE_MAP = {32: "AUTO", 34: "ECO", 36: "DAY"}
 
