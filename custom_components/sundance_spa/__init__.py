@@ -60,23 +60,11 @@ CLIENT_TYPE_PANEL  = 0x02
 CC_REQ_ALT         = 0x17
 
 DETECT_CHANNEL_CYCLES = 5
-CHECKS_BEFORE_RETRY   = 2
+CHECKS_BEFORE_RETRY   = 3   # Status-Updates abwarten zwischen Tastendrücken
 NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
-MAX_COMMAND_ATTEMPTS  = 64
-
-# ── Button-Codes (Klartext – wie HyperActiveJ/sundance780 Referenz) ──────────
-BTN_TEMP_UP        = 225
-BTN_TEMP_DOWN      = 226
-BTN_TEMP_RANGE_LOW = 200
-BTN_TEMP_RANGE_HI  = 201
-BTN_PUMP1          = 228
-BTN_PUMP2          = 229
-BTN_CLEARRAY       = 239
-BTN_LIGHT          = 241
-BTN_LIGHT_COLOR    = 242
-BTN_ZIRK           = 242
-BTN_BLOWER         = 237   # Klartext NICHT verwenden – steuert Pumpen; siehe BLOWER_CC_*
+MAX_COMMAND_ATTEMPTS  = 16  # Bus nicht fluten (sonst Touch-Panel träge)
+MAX_PENDING_CC        = 2   # max. wartende CC-Pakete – verhindert Bus-Überlastung
 
 # ── Lookup-Tabellen ──────────────────────────────────────────────────────────
 HEAT_MODE_MAP = {32: "AUTO", 34: "ECO", 36: "DAY"}
@@ -156,14 +144,17 @@ BLOWER_CC_BTN = 53
 BLOWER_CC_B6  = 217
 BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
 
-# Temperatur: Klartext 225/226 wie Referenz (HyperActiveJ). Funktioniert, sobald
-# der CC-Befehl auf dem *zugewiesenen* Kanal bei CTS gesendet wird.
-# Fallback-Paare (verschlüsselt) bleiben für experimentelle Scans verfügbar.
-TEMP_UP_CC_BTN   = BTN_TEMP_UP
-TEMP_UP_CC_B6    = 0
-TEMP_DOWN_CC_BTN = BTN_TEMP_DOWN
-TEMP_DOWN_CC_B6  = 0
-# Panel-Sniff: Range High = 141/69 (decoded 201) – optional encrypted form
+# Cameo 880: Temperatur-Tasten als verschlüsselte Panel-CC-Paare
+# (decoded = btn ^ b6 ^ 1 → 225 / 226). Klartext 225/0 wird vom Board als
+# BTN_NA (224) interpretiert und ignoriert. Verifiziert in tools/verify_temp_pairs.py.
+TEMP_UP_CC_BTN   = 18   # 18 ^ 242 ^ 1 = 225 (Warmer)
+TEMP_UP_CC_B6    = 242
+TEMP_DOWN_CC_BTN = 0    # 0 ^ 227 ^ 1 = 226 (Cooler)
+TEMP_DOWN_CC_B6  = 227
+# Alternativen aus Hunt (falls 18/242 nicht greift): 19/243 für UP
+TEMP_UP_CC_ALT: tuple[tuple[int, int], ...] = ((19, 243), (BTN_TEMP_UP, 0))
+TEMP_DOWN_CC_ALT: tuple[tuple[int, int], ...] = ((BTN_TEMP_DOWN, 0),)
+# Panel-Sniff: Range High = 141/69 (decoded 201)
 TEMP_RANGE_HI_CC_BTN = 141
 TEMP_RANGE_HI_CC_B6  = 69
 
@@ -451,18 +442,6 @@ class SpaClient:
                         channel,
                         [f"0x{c:02X}" for c in self._discovered_channels],
                     )
-                    # Konflikt: anderer Teilnehmer auf unserem Kanal
-                    if (
-                        self._assigned_channel is not None
-                        and channel == self._assigned_channel
-                        and channel in self._active_channels
-                    ):
-                        _LOGGER.warning(
-                            "Kanal-Konflikt auf 0x%02X – neu zuweisen", channel
-                        )
-                        self._assigned_channel = None
-                        self._channel_ready.clear()
-                        self._detect_state = 0
 
                 # Nur auf *unserem* Kanal senden (Halbduplex / CTS-Fenster)
                 if (
@@ -560,11 +539,18 @@ class SpaClient:
         ch = await self._ensure_channel()
         pkt = _build_cc(btn, ch, mtype, b6)
         async with self._pending_lock:
+            # Alte wartende Pakete verwerfen, damit der Bus nicht vollläuft
+            # und das physische Touch-Panel träge wird.
+            if len(self._pending) >= MAX_PENDING_CC:
+                dropped = len(self._pending) - MAX_PENDING_CC + 1
+                self._pending = self._pending[dropped:]
+                _LOGGER.debug("Pending-CC gekürzt (%d verworfen)", dropped)
             self._pending.append((ch, pkt))
         _LOGGER.info(
-            "Tastenbefehl eingeplant: btn=%d b6=%d kanal=0x%02X paket=%s",
+            "Tastenbefehl eingeplant: btn=%d b6=%d (dec=%d) kanal=0x%02X paket=%s",
             btn,
             b6,
+            btn ^ b6 ^ 1,
             ch,
             pkt.hex(" "),
         )
@@ -574,7 +560,7 @@ class SpaClient:
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Soll-Temperatur ±0.5 °C per TEMP_UP / TEMP_DOWN (Klartext 225/226)."""
+        """Soll-Temperatur ±0.5 °C per verschlüsseltem Panel-CC (Cameo 880)."""
         if warmer:
             btn, b6 = TEMP_UP_CC_BTN, TEMP_UP_CC_B6
             label = "TEMP_UP"
@@ -582,10 +568,11 @@ class SpaClient:
             btn, b6 = TEMP_DOWN_CC_BTN, TEMP_DOWN_CC_B6
             label = "TEMP_DOWN"
         _LOGGER.info(
-            "Sende %s (btn=%d b6=%d) – Versuch %d",
+            "Sende %s encrypted (btn=%d b6=%d dec=%d) – Versuch %d",
             label,
             btn,
             b6,
+            btn ^ b6 ^ 1,
             self._command_attempts + 1,
         )
         await self._queue_cc(btn, CC_REQ, b6)
