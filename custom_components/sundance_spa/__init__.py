@@ -53,6 +53,8 @@ CH_BROADCAST      = 0xFE
 MSG_CHANNEL_REQ    = 0x01
 MSG_CHANNEL_ASSIGN = 0x02
 MSG_CHANNEL_ACK    = 0x03
+MSG_EXISTING_CLIENT_REQ  = 0x04
+MSG_EXISTING_CLIENT_RESP = 0x05
 CLIENT_CLEAR_TO_SEND = 0x00
 CLIENT_TYPE_PANEL  = 0x02
 CC_REQ_ALT         = 0x17
@@ -61,8 +63,9 @@ DETECT_CHANNEL_CYCLES = 5
 CHECKS_BEFORE_RETRY   = 2
 NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
+MAX_COMMAND_ATTEMPTS  = 64
 
-# ── Button-Codes ─────────────────────────────────────────────────────────────
+# ── Button-Codes (Klartext – wie HyperActiveJ/sundance780 Referenz) ──────────
 BTN_TEMP_UP        = 225
 BTN_TEMP_DOWN      = 226
 BTN_TEMP_RANGE_LOW = 200
@@ -73,7 +76,7 @@ BTN_CLEARRAY       = 239
 BTN_LIGHT          = 241
 BTN_LIGHT_COLOR    = 242
 BTN_ZIRK           = 242
-BTN_BLOWER         = 237   # Klartext NIHT verwenden – steuert Pumpen; siehe BLOWER_CC_PANEL
+BTN_BLOWER         = 237   # Klartext NICHT verwenden – steuert Pumpen; siehe BLOWER_CC_*
 
 # ── Lookup-Tabellen ──────────────────────────────────────────────────────────
 HEAT_MODE_MAP = {32: "AUTO", 34: "ECO", 36: "DAY"}
@@ -153,13 +156,14 @@ BLOWER_CC_BTN = 53
 BLOWER_CC_B6  = 217
 BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
 
-# Cameo 880: Temperatur Warmer/Cooler = verschlüsseltes Panel-CC (nicht Klartext 225/226).
-# Hunt-Scan: Klartext 225/226 wirkungslos; 0/227 senkt Soll-Temp; 19/243 Kandidat Warmer.
-TEMP_UP_CC_BTN   = 19
-TEMP_UP_CC_B6    = 243
-TEMP_DOWN_CC_BTN = 0
-TEMP_DOWN_CC_B6  = 227
-# Panel-Sniff: Range High = 141/69 (decoded 201)
+# Temperatur: Klartext 225/226 wie Referenz (HyperActiveJ). Funktioniert, sobald
+# der CC-Befehl auf dem *zugewiesenen* Kanal bei CTS gesendet wird.
+# Fallback-Paare (verschlüsselt) bleiben für experimentelle Scans verfügbar.
+TEMP_UP_CC_BTN   = BTN_TEMP_UP
+TEMP_UP_CC_B6    = 0
+TEMP_DOWN_CC_BTN = BTN_TEMP_DOWN
+TEMP_DOWN_CC_B6  = 0
+# Panel-Sniff: Range High = 141/69 (decoded 201) – optional encrypted form
 TEMP_RANGE_HI_CC_BTN = 141
 TEMP_RANGE_HI_CC_B6  = 69
 
@@ -190,6 +194,22 @@ def _build_channel_ack(channel: int) -> bytes:
     msg[4] = MSG_CHANNEL_ACK
     msg[5] = _calc_cs(msg[1:5], 4)
     msg[6] = M_STARTEND
+    return bytes(msg)
+
+
+def _build_existing_client_resp(channel: int) -> bytes:
+    """Antwort auf Existing-Client-Request (0x05) – hält Kanalzuweisung am Leben."""
+    msg = bytearray(10)
+    msg[0] = M_STARTEND
+    msg[1] = 8
+    msg[2] = channel
+    msg[3] = 0xBF
+    msg[4] = MSG_EXISTING_CLIENT_RESP
+    msg[5] = 0x04
+    msg[6] = 0x08
+    msg[7] = 0x00
+    msg[8] = _calc_cs(msg[1:8], 7)
+    msg[9] = M_STARTEND
     return bytes(msg)
 
 
@@ -302,6 +322,7 @@ class SpaClient:
         self._target_temp = NO_CHANGE_REQUESTED
         self._temp_done = asyncio.Event()
         self._temp_check = 0
+        self._command_attempts = 0
         self._target_light_brightness = LIGHT_NO_CHANGE
         self._target_light_mode = LIGHT_NO_CHANGE
         self._light_done = asyncio.Event()
@@ -320,17 +341,20 @@ class SpaClient:
         self._connected = True
         self._reset_channel_state()
         self._recv_task = asyncio.create_task(self._receiver())
-        await self._write_direct(_build_channel_request())
+        # Channel-Discovery läuft im Receiver (CTS-Zyklen + ggf. Assignment-Request).
+        # Kein sofortiger Broadcast-Request – analog zur Referenzimplementierung.
         try:
-            await asyncio.wait_for(self._channel_ready.wait(), timeout=12.0)
+            await asyncio.wait_for(self._channel_ready.wait(), timeout=15.0)
         except asyncio.TimeoutError:
+            # Letzter Fallback: festen Panel-Kanal 0x10 nutzen
             self._assigned_channel = CMD_CHANNEL
             self._channel_ready.set()
             _LOGGER.warning(
-                "Kein Channel-Assignment – Fallback auf 0x%02X", CMD_CHANNEL
+                "Kein Channel-Assignment innerhalb 15 s – Fallback auf 0x%02X",
+                CMD_CHANNEL,
             )
         _LOGGER.info(
-            "Spa verbunden: %s:%s (Kanal 0x%02X)",
+            "Spa verbunden: %s:%s – Channel assigned: 0x%02X",
             self.host,
             self.port,
             self._assigned_channel or 0,
@@ -392,25 +416,62 @@ class SpaClient:
             mtype = msg[4]
             channel = msg[2]
 
+            # ── Channel Assignment Response (0x02) ──────────────────────────
             if mtype == MSG_CHANNEL_ASSIGN and len(msg) >= 7:
                 assigned = msg[5]
                 self._assigned_channel = assigned
                 self._channel_ready.set()
-                _LOGGER.info("Spa-Kanal zugewiesen: 0x%02X", assigned)
+                _LOGGER.info("Channel assigned: 0x%02X (via Assignment-Response)", assigned)
                 await self._write_direct(_build_channel_ack(assigned))
                 continue
 
+            # ── Existing-Client Request (0x04) – Board fragt nach alten Clients
+            if mtype == MSG_EXISTING_CLIENT_REQ and self._assigned_channel is not None:
+                await self._write_direct(
+                    _build_existing_client_resp(self._assigned_channel)
+                )
+                continue
+
+            # ── Client Clear-To-Send (0x00) → Channel-Request senden ─────────
             if (
                 mtype == CLIENT_CLEAR_TO_SEND
                 and self._assigned_channel is None
                 and self._detect_state >= DETECT_CHANNEL_CYCLES
             ):
+                _LOGGER.debug("CLIENT_CTS ohne Kanal – sende Channel-Request")
                 await self._write_direct(_build_channel_request())
+                continue
 
+            # ── Clear-To-Send (0x06) – einziges Fenster zum Senden ───────────
             if mtype == CLEAR_TO_SEND:
                 if channel not in self._discovered_channels:
                     self._discovered_channels.append(channel)
-                await self._flush_pending(channel)
+                    _LOGGER.debug(
+                        "CTS entdeckt auf Kanal 0x%02X (discovered=%s)",
+                        channel,
+                        [f"0x{c:02X}" for c in self._discovered_channels],
+                    )
+                    # Konflikt: anderer Teilnehmer auf unserem Kanal
+                    if (
+                        self._assigned_channel is not None
+                        and channel == self._assigned_channel
+                        and channel in self._active_channels
+                    ):
+                        _LOGGER.warning(
+                            "Kanal-Konflikt auf 0x%02X – neu zuweisen", channel
+                        )
+                        self._assigned_channel = None
+                        self._channel_ready.clear()
+                        self._detect_state = 0
+
+                # Nur auf *unserem* Kanal senden (Halbduplex / CTS-Fenster)
+                if (
+                    self._assigned_channel is not None
+                    and channel == self._assigned_channel
+                ):
+                    await self._flush_pending(channel)
+
+                # Idle-Kanal wählen, falls noch kein Assignment
                 if self._detect_state < DETECT_CHANNEL_CYCLES:
                     self._detect_state += 1
                 if (
@@ -420,9 +481,24 @@ class SpaClient:
                     self._pick_idle_channel()
                 continue
 
-            if mtype in (CC_REQ, CC_REQ_ALT) and channel not in self._active_channels:
-                self._active_channels.append(channel)
+            # ── Andere Geräte aktiv (CC-Traffic) ────────────────────────────
+            if mtype in (CC_REQ, CC_REQ_ALT):
+                if channel not in self._active_channels:
+                    self._active_channels.append(channel)
+                    _LOGGER.debug(
+                        "Aktiver Bus-Kanal: 0x%02X (active=%s)",
+                        channel,
+                        [f"0x{c:02X}" for c in self._active_channels],
+                    )
+                if self._detect_state < DETECT_CHANNEL_CYCLES:
+                    self._detect_state += 1
+                    if (
+                        self._detect_state >= DETECT_CHANNEL_CYCLES
+                        and self._assigned_channel is None
+                    ):
+                        self._pick_idle_channel()
 
+            # ── Status / Lights ─────────────────────────────────────────────
             if mtype in (STATUS_UPDATE, STATUS_UPDATE_ALT):
                 dec = _decode_c4(msg)
                 if dec:
@@ -440,14 +516,25 @@ class SpaClient:
                     await self._handle_light_feedback(dec)
 
     def _pick_idle_channel(self) -> None:
+        """Wählt den ersten freigegebenen CTS-Kanal, der nicht von anderem Panel genutzt wird."""
         for ch in sorted(self._discovered_channels):
             if ch not in self._active_channels:
                 self._assigned_channel = ch
                 self._channel_ready.set()
-                _LOGGER.info("Freien Bus-Kanal gewählt: 0x%02X", ch)
+                _LOGGER.info(
+                    "Channel assigned: 0x%02X (idle CTS-Kanal, active=%s)",
+                    ch,
+                    [f"0x{c:02X}" for c in self._active_channels],
+                )
                 return
+        _LOGGER.warning(
+            "Kein freier Kanal gefunden (discovered=%s, active=%s) – warte weiter",
+            [f"0x{c:02X}" for c in self._discovered_channels],
+            [f"0x{c:02X}" for c in self._active_channels],
+        )
 
     async def _flush_pending(self, channel: int) -> None:
+        """Sendet genau ein wartendes CC-Paket auf dem CTS-Kanal (Halbduplex)."""
         assert self._writer is not None
         async with self._pending_lock:
             for idx, (pkt_ch, pkt) in enumerate(self._pending):
@@ -455,6 +542,11 @@ class SpaClient:
                     self._writer.write(pkt)
                     await self._writer.drain()
                     self._pending.pop(idx)
+                    _LOGGER.debug(
+                        "CC gesendet auf Kanal 0x%02X: %s",
+                        channel,
+                        pkt.hex(" "),
+                    )
                     return
 
     async def _write_direct(self, packet: bytes) -> None:
@@ -464,24 +556,43 @@ class SpaClient:
         await self._writer.drain()
 
     async def _queue_cc(self, btn: int, mtype: int = CC_REQ, b6: int = 0) -> None:
-        await self._ensure_channel()
-        # Sundance Cameo / Balboa: CTS auf 0x10, Pumpen funktionieren dort zuverlässig.
-        ch = CMD_CHANNEL
+        """Reiht einen Tastenbefehl ein – wird nur bei CTS auf dem zugewiesenen Kanal gesendet."""
+        ch = await self._ensure_channel()
+        pkt = _build_cc(btn, ch, mtype, b6)
         async with self._pending_lock:
-            self._pending.append((ch, _build_cc(btn, ch, mtype, b6)))
+            self._pending.append((ch, pkt))
+        _LOGGER.info(
+            "Tastenbefehl eingeplant: btn=%d b6=%d kanal=0x%02X paket=%s",
+            btn,
+            b6,
+            ch,
+            pkt.hex(" "),
+        )
 
     async def send_blower_toggle(self) -> None:
         """Blubber ein/aus – verschlüsseltes Panel-CC (53/217)."""
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Soll-Temperatur ±0.5 °C per verschlüsseltem Panel-CC."""
+        """Soll-Temperatur ±0.5 °C per TEMP_UP / TEMP_DOWN (Klartext 225/226)."""
         if warmer:
-            await self._queue_cc(TEMP_UP_CC_BTN, CC_REQ, TEMP_UP_CC_B6)
+            btn, b6 = TEMP_UP_CC_BTN, TEMP_UP_CC_B6
+            label = "TEMP_UP"
         else:
-            await self._queue_cc(TEMP_DOWN_CC_BTN, CC_REQ, TEMP_DOWN_CC_B6)
+            btn, b6 = TEMP_DOWN_CC_BTN, TEMP_DOWN_CC_B6
+            label = "TEMP_DOWN"
+        _LOGGER.info(
+            "Sende %s (btn=%d b6=%d) – Versuch %d",
+            label,
+            btn,
+            b6,
+            self._command_attempts + 1,
+        )
+        await self._queue_cc(btn, CC_REQ, b6)
+        self._command_attempts += 1
 
     async def _handle_temp_feedback(self, status: dict) -> None:
+        """Feedback-Schleife: TEMP_UP/DOWN bis Sollwert erreicht (Referenz-Logik)."""
         if self._temp_check > 0:
             self._temp_check -= 1
         if self._temp_check > 0 or self._target_temp == NO_CHANGE_REQUESTED:
@@ -490,30 +601,34 @@ class SpaClient:
         current = status["set_temp"]
         if abs(current - self._target_temp) < 0.3:
             self._target_temp = NO_CHANGE_REQUESTED
+            self._command_attempts = 0
             self._temp_done.set()
-            _LOGGER.info("Soll-Temperatur erreicht: %.1f °C", current)
+            _LOGGER.info(
+                "Soll-Temperatur erreicht: %.1f °C (Kanal 0x%02X)",
+                current,
+                self._assigned_channel or 0,
+            )
+            return
+
+        if self._command_attempts >= MAX_COMMAND_ATTEMPTS:
+            _LOGGER.error(
+                "Temperatur-Befehl nach %d Versuchen abgebrochen (aktuell %.1f, Ziel %.1f)",
+                self._command_attempts,
+                current,
+                self._target_temp,
+            )
+            self._target_temp = NO_CHANGE_REQUESTED
+            self._temp_done.set()
             return
 
         warmer = self._target_temp > current
-        # #region agent log
-        _agent_debug_log(
-            "__init__.py:_handle_temp_feedback",
-            "press",
-            {
-                "warmer": warmer,
-                "panel_cc": (
-                    f"{TEMP_UP_CC_BTN}/{TEMP_UP_CC_B6}"
-                    if warmer
-                    else f"{TEMP_DOWN_CC_BTN}/{TEMP_DOWN_CC_B6}"
-                ),
-                "current": current,
-                "target": self._target_temp,
-                "raw_d8": status.get("raw_d8"),
-            },
-            "H23",
-            run_id="post-fix",
+        _LOGGER.debug(
+            "Temp-Feedback: aktuell=%.1f Ziel=%.1f → %s (Versuch %d)",
+            current,
+            self._target_temp,
+            "TEMP_UP" if warmer else "TEMP_DOWN",
+            self._command_attempts + 1,
         )
-        # #endregion
         await self._send_temp_step(warmer)
         self._temp_check = CHECKS_BEFORE_RETRY
 
@@ -617,11 +732,16 @@ class SpaClient:
         want_high = target >= 37.0
         if high_range != want_high:
             if want_high:
-                await self._queue_cc(
-                    TEMP_RANGE_HI_CC_BTN, CC_REQ, TEMP_RANGE_HI_CC_B6
-                )
+                # Klartext 201; encrypted 141/69 als Fallback falls nötig
+                await self._queue_cc(BTN_TEMP_RANGE_HI)
             else:
                 await self._queue_cc(BTN_TEMP_RANGE_LOW)
+            _LOGGER.info(
+                "Temperaturbereich umschalten: %s (raw_d8=%s, target=%.1f)",
+                "HIGH" if want_high else "LOW",
+                current_raw,
+                target,
+            )
             self._temp_check = CHECKS_BEFORE_RETRY
 
     async def _ensure_pumps_off_for_heating(self) -> None:
@@ -639,7 +759,7 @@ class SpaClient:
             await asyncio.sleep(1.5)
 
     async def set_temperature(self, target: float) -> None:
-        """Soll-Temperatur per Warmer/Cooler-Tasten (Feedback-Schleife)."""
+        """Soll-Temperatur per TEMP_UP/TEMP_DOWN-Tasten (Feedback-Schleife)."""
         target = max(20.0, min(40.0, target))
         async with self._cmd_lock:
             snap = await self._status_snapshot()
@@ -648,36 +768,20 @@ class SpaClient:
             if abs(snap["set_temp"] - target) < 0.3:
                 return
 
-            await self._ensure_channel()
+            ch = await self._ensure_channel()
+            _LOGGER.info(
+                "set_temperature: Ziel=%.1f °C aktuell=%.1f °C kanal=0x%02X raw_d8=%s",
+                target,
+                snap["set_temp"],
+                ch,
+                snap["raw_d8"],
+            )
             await self._ensure_pumps_off_for_heating()
             await self._ensure_temp_range(target, snap["raw_d8"])
             self._temp_done.clear()
             self._temp_check = 0
+            self._command_attempts = 0
             self._target_temp = target
-            # #region agent log
-            _agent_debug_log(
-                "__init__.py:set_temperature",
-                "start",
-                {
-                    "target": target,
-                    "current": snap["set_temp"],
-                    "raw_d8": snap["raw_d8"],
-                    "p1": snap["pump1"],
-                    "p2": snap["pump2"],
-                    "in_menu": snap.get("in_menu"),
-                    "temp_up_cc": f"{TEMP_UP_CC_BTN}/{TEMP_UP_CC_B6}",
-                    "temp_down_cc": f"{TEMP_DOWN_CC_BTN}/{TEMP_DOWN_CC_B6}",
-                },
-                "H23",
-                run_id="post-fix",
-            )
-            # #endregion
-            _LOGGER.debug(
-                "Ziel-Temperatur %.1f °C (aktuell %.1f °C, raw=%s)",
-                target,
-                snap["set_temp"],
-                snap["raw_d8"],
-            )
             await self._handle_temp_feedback(snap)
 
             try:
@@ -687,10 +791,12 @@ class SpaClient:
                 got = final["set_temp"] if final else None
                 raise UpdateFailed(
                     f"Soll-Temperatur konnte nicht auf {target:.1f} °C gesetzt werden "
-                    f"(aktuell: {got} °C). Prüfen Sie ggf. die Temperatur-Sperre am Panel."
+                    f"(aktuell: {got} °C, Kanal 0x{ch:02X}). "
+                    "Prüfen Sie ggf. die Temperatur-Sperre am Panel."
                 ) from exc
             finally:
                 self._target_temp = NO_CHANGE_REQUESTED
+                self._command_attempts = 0
 
     async def set_light(
         self,
