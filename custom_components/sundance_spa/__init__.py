@@ -157,19 +157,21 @@ BLOWER_CC_BTN = 53
 BLOWER_CC_B6  = 217
 BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
 
-# Cameo 880: Temperatur-Tasten als verschlüsselte Panel-CC-Paare
-# (decoded = btn ^ b6 ^ 1 → 225 / 226). Klartext 225/0 wird vom Board als
-# BTN_NA (224) interpretiert und ignoriert. Verifiziert in tools/verify_temp_pairs.py.
-TEMP_UP_CC_BTN   = 18   # 18 ^ 242 ^ 1 = 225 (Warmer)
-TEMP_UP_CC_B6    = 242
-TEMP_DOWN_CC_BTN = 0    # 0 ^ 227 ^ 1 = 226 (Cooler)
-TEMP_DOWN_CC_B6  = 227
-# Alternativen aus Hunt (falls 18/242 nicht greift): 19/243 für UP
-TEMP_UP_CC_ALT: tuple[tuple[int, int], ...] = ((19, 243), (BTN_TEMP_UP, 0))
-TEMP_DOWN_CC_ALT: tuple[tuple[int, int], ...] = ((BTN_TEMP_DOWN, 0),)
+# Temperatur: mehrere CC-Encodings rotieren (Cameo akzeptiert teils nur Panel-Paare).
+# Format: (btn, b6) – Board dekodiert oft als btn ^ b6 ^ 1.
+TEMP_UP_VARIANTS: tuple[tuple[int, int], ...] = (
+    (18, 242),           # Panel-Paar: 18^242^1 = 225
+    (19, 243),           # Hunt-Alternative: 19^243^1 = 225
+    (BTN_TEMP_UP, 0),    # Klartext wie HyperActiveJ-Referenz
+)
+TEMP_DOWN_VARIANTS: tuple[tuple[int, int], ...] = (
+    (0, 227),            # Panel-Paar: 0^227^1 = 226
+    (BTN_TEMP_DOWN, 0),  # Klartext
+)
 # Panel-Sniff: Range High = 141/69 (decoded 201)
 TEMP_RANGE_HI_CC_BTN = 141
 TEMP_RANGE_HI_CC_B6  = 69
+BTN_MENU = 254
 
 
 def _build_channel_request() -> bytes:
@@ -456,11 +458,11 @@ class SpaClient:
                         [f"0x{c:02X}" for c in self._discovered_channels],
                     )
 
-                # Nur auf *unserem* Kanal senden (Halbduplex / CTS-Fenster)
-                if (
-                    self._assigned_channel is not None
-                    and channel == self._assigned_channel
-                ):
+                # Auf zugewiesenem Kanal und ggf. 0x10 senden (Halbduplex / CTS)
+                if self._assigned_channel is not None and channel == self._assigned_channel:
+                    await self._flush_pending(channel)
+                elif channel == CMD_CHANNEL:
+                    # Fallback: Pumpen-/Temp-Befehle, die extra auf 0x10 liegen
                     await self._flush_pending(channel)
 
                 # Idle-Kanal wählen, falls noch kein Assignment
@@ -573,22 +575,30 @@ class SpaClient:
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Soll-Temperatur ±0.5 °C per verschlüsseltem Panel-CC (Cameo 880)."""
-        if warmer:
-            btn, b6 = TEMP_UP_CC_BTN, TEMP_UP_CC_B6
-            label = "TEMP_UP"
-        else:
-            btn, b6 = TEMP_DOWN_CC_BTN, TEMP_DOWN_CC_B6
-            label = "TEMP_DOWN"
+        """Soll-Temperatur ±0.5 °C – rotiert durch bekannte CC-Encodings."""
+        variants = TEMP_UP_VARIANTS if warmer else TEMP_DOWN_VARIANTS
+        btn, b6 = variants[self._command_attempts % len(variants)]
+        label = "TEMP_UP" if warmer else "TEMP_DOWN"
         _LOGGER.info(
-            "Sende %s encrypted (btn=%d b6=%d dec=%d) – Versuch %d",
+            "Sende %s (btn=%d b6=%d dec=%d variant=%d/%d) – Versuch %d",
             label,
             btn,
             b6,
             btn ^ b6 ^ 1,
+            (self._command_attempts % len(variants)) + 1,
+            len(variants),
             self._command_attempts + 1,
         )
+        # Primär: zugewiesener Kanal (wie Pumpen)
         await self._queue_cc(btn, CC_REQ, b6)
+        # Zusätzlich auf 0x10 einreihen – dort laufen Pumpen-CCs historisch zuverlässig
+        ch = await self._ensure_channel()
+        if ch != CMD_CHANNEL:
+            pkt = _build_cc(btn, CMD_CHANNEL, CC_REQ, b6)
+            async with self._pending_lock:
+                if len(self._pending) < MAX_PENDING_CC + 1:
+                    self._pending.append((CMD_CHANNEL, pkt))
+            _LOGGER.debug("Temp-CC zusätzlich auf Kanal 0x10 eingeplant")
         self._command_attempts += 1
 
     async def _handle_temp_feedback(self, status: dict) -> None:
@@ -770,12 +780,20 @@ class SpaClient:
 
             ch = await self._ensure_channel()
             _LOGGER.info(
-                "set_temperature: Ziel=%.1f °C aktuell=%.1f °C kanal=0x%02X raw_d8=%s",
+                "set_temperature: Ziel=%.1f °C aktuell=%.1f °C kanal=0x%02X "
+                "raw_d8=%s display=%s in_menu=%s",
                 target,
                 snap["set_temp"],
                 ch,
                 snap["raw_d8"],
+                snap.get("display"),
+                snap.get("in_menu"),
             )
+            # Aus Menü/Einstellungen heraus, sonst werden Warmer/Cooler ignoriert
+            if snap.get("in_menu"):
+                _LOGGER.info("Panel im Menü – sende MENU-Exit (254)")
+                await self._queue_cc(BTN_MENU)
+                await asyncio.sleep(1.0)
             await self._ensure_pumps_off_for_heating()
             await self._ensure_temp_range(target, snap["raw_d8"])
             self._temp_done.clear()
