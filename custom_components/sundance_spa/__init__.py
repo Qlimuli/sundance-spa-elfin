@@ -90,8 +90,16 @@ DISPLAY_MAP = {
     31: "Ist-Temperatur (idle)",
     32: "Ist-Temperatur",
     36: "Ist-Temperatur",
+     8: "Cameo Home/Idle",
     35: "Primärfiltration",
     42: "Heizmodus",
+    47: "Sekundärfiltration",
+    48: "UV-Intervall",
+    51: "Wasserwechsel",
+    53: "Filterwechsel",
+    59: "Datum",
+    62: "Uhrzeit",
+    14: "Panel-/Temp-Sperre",
      3: "Einstellungs-Menü",
      0: "Temperatureinheit",
 }
@@ -104,7 +112,9 @@ LIGHT_MODE_MAP = {
 
 LIGHT_MODE_BY_NAME = {name: code for code, name in LIGHT_MODE_MAP.items()}
 
-DISPLAY_TEMP_OK = {22, 23, 30, 31, 32, 36}
+# Cameo: Code 8 ist oft Normalzustand. Nur bekannte Menüs blockieren.
+DISPLAY_TEMP_OK = {8, 22, 23, 30, 31, 32, 36}
+DISPLAY_MENU_CODES = {0, 3, 14, 35, 42, 47, 48, 51, 53, 59, 62}
 
 
 # ── Protokoll-Hilfsfunktionen ────────────────────────────────────────────────
@@ -259,7 +269,9 @@ def _decode_c4(raw: bytes) -> dict | None:
         "blower":       False,  # kein zuverlässiges RS485-Feld bekannt (≠ Pumpe 1)
         "display_val":  d[13],
         "display":      DISPLAY_MAP.get(d[13], f"Code {d[13]}"),
-        "in_menu":      d[13] not in DISPLAY_TEMP_OK,
+        "display_code": d[13],
+        # Nur bekannte Menü-Screens blockieren – Idle/unbekannt erlaubt Temp
+        "in_menu":      d[13] in DISPLAY_MENU_CODES,
         "celsius_scale": celsius_scale,
         "raw_d8":       set_raw,
         "raw":          list(d),
@@ -334,6 +346,10 @@ class SpaClient:
         self._cc_sent = 0
         self._cts_own = 0
         self._last_cc_hex: str | None = None
+        self._debug_cmd = False  # erhöhte Logs während Temp/Licht-Steuerung
+        self._last_logged_display: int | None = None
+        self._last_logged_set: float | None = None
+        self._sniff_panel_cc = True  # Panel-Tasten (fremde Kanäle) immer loggen
         self._target_light_brightness = LIGHT_NO_CHANGE
         self._target_light_mode = LIGHT_NO_CHANGE
         self._light_done = asyncio.Event()
@@ -482,8 +498,8 @@ class SpaClient:
             if mtype in (CC_REQ, CC_REQ_ALT):
                 if channel not in self._active_channels:
                     self._active_channels.append(channel)
-                    _LOGGER.debug(
-                        "Aktiver Bus-Kanal: 0x%02X (active=%s)",
+                    _LOGGER.info(
+                        "Aktiver Bus-Kanal erkannt: 0x%02X (active=%s)",
                         channel,
                         [f"0x{c:02X}" for c in self._active_channels],
                     )
@@ -495,6 +511,27 @@ class SpaClient:
                     ):
                         self._pick_idle_channel()
 
+                # Panel-Sniff: physische Tastendrücke loggen (wichtig für Temp/Licht-Codes)
+                if (
+                    self._sniff_panel_cc
+                    and len(msg) >= 7
+                    and channel != self._assigned_channel
+                ):
+                    btn_b5 = msg[5]
+                    b6 = msg[6] if len(msg) > 6 else 0
+                    decoded = btn_b5 ^ b6 ^ 1
+                    if decoded != 224:  # BTN_NA
+                        _LOGGER.info(
+                            "PANEL-TASTE erkannt | ch=0x%02X mtype=0x%02X "
+                            "btn=%d b6=%d dec=%d raw=%s",
+                            channel,
+                            mtype,
+                            btn_b5,
+                            b6,
+                            decoded,
+                            msg.hex(" "),
+                        )
+
             # ── Status / Lights ─────────────────────────────────────────────
             if mtype in (STATUS_UPDATE, STATUS_UPDATE_ALT):
                 dec = _decode_c4(msg)
@@ -502,6 +539,28 @@ class SpaClient:
                     async with self._lock:
                         self._status = dec
                         self._status_seq += 1
+                    if self._debug_cmd:
+                        dcode = dec.get("display_code")
+                        st = dec.get("set_temp")
+                        if (
+                            dcode != self._last_logged_display
+                            or st != self._last_logged_set
+                        ):
+                            self._last_logged_display = dcode
+                            self._last_logged_set = st
+                            _LOGGER.info(
+                                "STATUS | set=%.1f raw_d8=%s cur=%s display=%s "
+                                "code=%s in_menu=%s heat=%s p1=%s p2=%s",
+                                st if st is not None else -1,
+                                dec.get("raw_d8"),
+                                dec.get("cur_temp"),
+                                dec.get("display"),
+                                dcode,
+                                dec.get("in_menu"),
+                                dec.get("heat_active"),
+                                dec.get("pump1"),
+                                dec.get("pump2"),
+                            )
                     await self._handle_temp_feedback(dec)
 
             elif mtype in (LIGHTS_UPDATE, LIGHTS_UPDATE_ALT):
@@ -510,6 +569,18 @@ class SpaClient:
                     async with self._lock:
                         self._lights = dec
                         self._lights_seq += 1
+                    if self._debug_cmd:
+                        _LOGGER.info(
+                            "LIGHTS | on=%s bright=%s mode=%s mode_raw=%s "
+                            "rgb=(%s,%s,%s)",
+                            dec.get("on"),
+                            dec.get("brightness_raw"),
+                            dec.get("mode"),
+                            dec.get("mode_raw"),
+                            dec.get("r"),
+                            dec.get("g"),
+                            dec.get("b"),
+                        )
                     await self._handle_light_feedback(dec)
 
     def _pick_idle_channel(self) -> None:
@@ -666,11 +737,19 @@ class SpaClient:
             return
 
         if self._command_attempts >= MAX_COMMAND_ATTEMPTS:
+            hint = ""
+            if self._cc_sent > 0 and abs(current - self._target_temp) >= 0.3:
+                hint = (
+                    " | HINWEIS: CCs wurden gesendet, Temp ändert sich nicht. "
+                    "Bitte am Panel manuell Wärmer drücken und im Log nach "
+                    "'PANEL-TASTE erkannt' suchen (echter Button-Code). "
+                    "Licht/Temp-Codes können bei Cameo iTouch abweichen."
+                )
             _LOGGER.error(
                 "Temperatur-Befehl abgebrochen nach %d Versuchen | "
                 "aktuell=%.1f Ziel=%.1f | kanal=0x%02X cts_own=%d "
-                "queued=%d sent=%d last_cc=%s display=%s in_menu=%s "
-                "p1=%s p2=%s raw_d8=%s",
+                "queued=%d sent=%d last_cc=%s display=%s code=%s "
+                "in_menu=%s p1=%s p2=%s raw_d8=%s%s",
                 self._command_attempts,
                 current,
                 self._target_temp,
@@ -680,10 +759,12 @@ class SpaClient:
                 self._cc_sent,
                 self._last_cc_hex,
                 status.get("display"),
+                status.get("display_code"),
                 status.get("in_menu"),
                 status.get("pump1"),
                 status.get("pump2"),
                 status.get("raw_d8"),
+                hint,
             )
             self._target_temp = NO_CHANGE_REQUESTED
             self._temp_done.set()
@@ -712,12 +793,23 @@ class SpaClient:
 
         if self._target_light_mode != LIGHT_NO_CHANGE:
             if lights["mode_raw"] == self._target_light_mode:
+                _LOGGER.info(
+                    "Licht-Modus erreicht: %s (raw=%s)",
+                    lights.get("mode"),
+                    lights["mode_raw"],
+                )
                 self._target_light_mode = LIGHT_NO_CHANGE
                 self._light_done.set()
             elif lights["brightness_raw"] == 0:
+                _LOGGER.info("Licht-Feedback: aus → sende BTN_LIGHT (241)")
                 await self._queue_cc(BTN_LIGHT)
                 self._light_check = CHECKS_BEFORE_RETRY
             else:
+                _LOGGER.info(
+                    "Licht-Feedback: mode_raw=%s Ziel=%s → sende BTN_LIGHT_COLOR (242)",
+                    lights["mode_raw"],
+                    self._target_light_mode,
+                )
                 await self._queue_cc(BTN_LIGHT_COLOR)
                 self._light_check = CHECKS_BEFORE_RETRY
             return
@@ -726,10 +818,21 @@ class SpaClient:
             return
 
         if lights["brightness_raw"] == self._target_light_brightness:
+            _LOGGER.info(
+                "Licht-Helligkeit erreicht: %s (Ziel=%s)",
+                lights["brightness_raw"],
+                self._target_light_brightness,
+            )
             self._target_light_brightness = LIGHT_NO_CHANGE
             self._light_done.set()
             return
 
+        _LOGGER.info(
+            "Licht-Feedback: bright=%s Ziel=%s → sende BTN_LIGHT (241) | sent=%d",
+            lights["brightness_raw"],
+            self._target_light_brightness,
+            self._cc_sent,
+        )
         await self._queue_cc(BTN_LIGHT)
         self._light_check = CHECKS_BEFORE_RETRY
 
@@ -845,7 +948,9 @@ class SpaClient:
             ch = await self._ensure_channel()
             self._cc_queued = 0
             self._cc_sent = 0
-            # cts_own nicht resetten – zeigt, ob Kanal überhaupt CTS bekommt
+            self._debug_cmd = True
+            self._last_logged_display = None
+            self._last_logged_set = None
             _LOGGER.info(
                 "set_temperature START | Ziel=%.1f aktuell=%.1f | "
                 "kanal=0x%02X raw_d8=%s display=%s in_menu=%s "
@@ -901,6 +1006,7 @@ class SpaClient:
             finally:
                 self._target_temp = NO_CHANGE_REQUESTED
                 self._command_attempts = 0
+                self._debug_cmd = False
 
     async def set_light(
         self,
@@ -912,10 +1018,25 @@ class SpaClient:
         """Licht steuern mit Retry/Feedback wie im Sundance-RS485-Referenzprojekt."""
         async with self._cmd_lock:
             await self._ensure_channel()
+            self._debug_cmd = True
+            self._cc_queued = 0
+            self._cc_sent = 0
             self._light_done.clear()
             self._light_check = 0
             self._target_light_mode = LIGHT_NO_CHANGE
             self._target_light_brightness = LIGHT_NO_CHANGE
+            lights0 = await self._lights_snapshot()
+            _LOGGER.info(
+                "set_light START | on=%s brightness_pct=%s effect=%s | "
+                "aktuell on=%s bright=%s mode=%s | kanal=0x%02X",
+                on,
+                brightness_pct,
+                effect,
+                lights0.get("on") if lights0 else None,
+                lights0.get("brightness_raw") if lights0 else None,
+                lights0.get("mode") if lights0 else None,
+                self._assigned_channel or 0,
+            )
 
             if effect is not None:
                 mode = LIGHT_MODE_BY_NAME.get(effect)
@@ -946,13 +1067,35 @@ class SpaClient:
 
             try:
                 await asyncio.wait_for(self._light_done.wait(), timeout=60.0)
+                _LOGGER.info(
+                    "set_light OK | sent=%d queued=%d last_cc=%s",
+                    self._cc_sent,
+                    self._cc_queued,
+                    self._last_cc_hex,
+                )
             except asyncio.TimeoutError as exc:
                 lights = await self._lights_snapshot()
                 state = "an" if lights and lights.get("on") else "aus"
-                raise UpdateFailed(f"Licht-Zielzustand nicht erreicht (aktuell {state})") from exc
+                _LOGGER.error(
+                    "set_light TIMEOUT | aktuell=%s bright=%s mode=%s | "
+                    "sent=%d queued=%d last_cc=%s kanal=0x%02X | "
+                    "Bitte am Panel Licht drücken und nach 'PANEL-TASTE erkannt' suchen",
+                    state,
+                    lights.get("brightness_raw") if lights else None,
+                    lights.get("mode") if lights else None,
+                    self._cc_sent,
+                    self._cc_queued,
+                    self._last_cc_hex,
+                    self._assigned_channel or 0,
+                )
+                raise UpdateFailed(
+                    f"Licht-Zielzustand nicht erreicht (aktuell {state}, "
+                    f"gesendet={self._cc_sent}/{self._cc_queued})"
+                ) from exc
             finally:
                 self._target_light_brightness = LIGHT_NO_CHANGE
                 self._target_light_mode = LIGHT_NO_CHANGE
+                self._debug_cmd = False
 
 
 # ── DataUpdateCoordinator ────────────────────────────────────────────────────
