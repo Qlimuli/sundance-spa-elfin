@@ -61,11 +61,11 @@ CLIENT_TYPE_PANEL  = 0x02
 CC_REQ_ALT         = 0x17
 
 DETECT_CHANNEL_CYCLES = 5
-CHECKS_BEFORE_RETRY   = 8   # Status-Pakete zwischen Temp-Schritten
-TEMP_STEP_MIN_S       = 2.5 # Mindestabstand – Status braucht Zeit zum Setzen
+CHECKS_BEFORE_RETRY   = 12   # Status-Pakete zwischen Temp-Schritten
+TEMP_STEP_MIN_S       = 3.0 # Mindestabstand – Status braucht Zeit zum Setzen
 NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
-MAX_COMMAND_ATTEMPTS  = 24  # harte Obergrenze (kein Bus-Spam)
+MAX_COMMAND_ATTEMPTS  = 80  # harte Obergrenze (kein Bus-Spam)
 MAX_PENDING_CC        = 1   # nur 1 Befehl auf dem Bus – schont Panel
 PENDING_WAIT_S        = 4.0 # max. Warten bis CTS den Slot freigibt
 
@@ -863,7 +863,7 @@ class SpaClient:
         self._command_attempts += 1
 
     async def _handle_temp_feedback(self, status: dict) -> None:
-        """Feedback: bei Fortschritt Code merken; bei Rückschritt anderen Code."""
+        """Geduldige Temp-Schleife: pro gesendetem Schritt warten, bis Status sich ändert."""
         if self._temp_check > 0:
             self._temp_check -= 1
         if self._temp_check > 0 or self._target_temp == NO_CHANGE_REQUESTED:
@@ -877,55 +877,59 @@ class SpaClient:
             self._last_temp_seen = current
             self._temp_done.set()
             _LOGGER.warning(
-                "Soll-Temperatur erreicht: %.1f °C | sent=%d",
-                current, self._cc_sent,
+                "Soll-Temperatur erreicht: %.1f °C | sent=%d attempts=%d",
+                current, self._cc_sent, self._command_attempts,
             )
             return
 
-        if self._last_temp_seen is not None:
-            prev_err = abs(self._target_temp - self._last_temp_seen)
-            cur_err = abs(self._target_temp - current)
-            delta = current - self._last_temp_seen
-            if cur_err < prev_err - 0.15:
-                _LOGGER.warning(
-                    "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code_idx=%s",
-                    self._last_temp_seen, current, self._target_temp,
-                    self._last_temp_idx,
-                )
-                self._temp_no_progress = 0
-                # Erfolgreichen Code-Index merken
-                if self._last_temp_warmer:
-                    self._temp_up_idx = self._last_temp_idx
-                else:
-                    self._temp_down_idx = self._last_temp_idx
-                self._last_temp_seen = current
-            elif abs(delta) >= 0.25:
-                self._temp_no_progress += 1
-                _LOGGER.warning(
-                    "Temp-Rückschritt: %.1f → %.1f (Ziel %.1f) idx=%s – wechsle Code",
-                    self._last_temp_seen, current, self._target_temp,
-                    self._last_temp_idx,
-                )
-                # Falschen Code verwerfen, nächsten nehmen
-                if self._last_temp_warmer:
-                    pairs = TEMP_UP_C6
-                    self._temp_up_idx = ((self._last_temp_idx or 0) + 1) % len(pairs)
-                else:
-                    pairs = TEMP_DOWN_C6
-                    self._temp_down_idx = ((self._last_temp_idx or 0) + 1) % len(pairs)
-                self._last_temp_seen = current
-            else:
-                self._temp_no_progress += 1
+        if self._last_temp_seen is None:
+            self._last_temp_seen = current
 
-        steps_needed = abs(self._target_temp - (self._temp_start or current)) / 0.5
-        max_att = max(MAX_COMMAND_ATTEMPTS, int(steps_needed) * 4 + 12)
-        if self._temp_no_progress >= 12 or self._command_attempts >= max_att:
+        prev_err = abs(self._target_temp - self._last_temp_seen)
+        cur_err = abs(self._target_temp - current)
+        moved = abs(current - self._last_temp_seen) >= 0.25
+
+        if moved and cur_err < prev_err - 0.15:
+            # Echter Fortschritt Richtung Ziel
+            _LOGGER.warning(
+                "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) – weiter…",
+                self._last_temp_seen, current, self._target_temp,
+            )
+            self._temp_no_progress = 0
+            self._last_temp_seen = current
+            # Kurze Pause, dann nächsten Schritt
+            self._temp_check = max(CHECKS_BEFORE_RETRY, 6)
+            warmer = self._target_temp > current
+            await self._send_temp_step(warmer)
+            return
+
+        if moved and cur_err > prev_err + 0.15:
+            # Falsche Richtung – Code merken und weitermachen (nicht abbrechen)
+            _LOGGER.warning(
+                "Temp-Gegenrichtung: %.1f → %.1f (Ziel %.1f) – korrigiere",
+                self._last_temp_seen, current, self._target_temp,
+            )
+            self._last_temp_seen = current
+            self._temp_no_progress += 1
+        elif not moved:
+            # Kein Status-Update nach letztem Befehl – erneut senden (geduldig)
+            self._temp_no_progress += 1
+            _LOGGER.warning(
+                "Temp warte/retry | aktuell=%.1f Ziel=%.1f no_change=%d attempts=%d",
+                current, self._target_temp, self._temp_no_progress,
+                self._command_attempts,
+            )
+
+        # Sehr geduldig: erst nach vielen erfolglosen Versuchen aufgeben
+        steps_left = abs(self._target_temp - current) / 0.5
+        max_att = max(MAX_COMMAND_ATTEMPTS, int(steps_left) * 20 + 30)
+        max_stall = max(40, int(steps_left) * 15)
+        if self._command_attempts >= max_att and self._temp_no_progress >= max_stall:
             _LOGGER.error(
-                "Temperatur abgebrochen | aktuell=%.1f Ziel=%.1f start=%s "
-                "attempts=%d no_progress=%d sent=%d last_cc=%s",
-                current, self._target_temp, self._temp_start,
-                self._command_attempts, self._temp_no_progress,
-                self._cc_sent, self._last_cc_hex,
+                "Temperatur abgebrochen | aktuell=%.1f Ziel=%.1f attempts=%d "
+                "no_change=%d sent=%d (System zu langsam oder Codes wirkungslos)",
+                current, self._target_temp, self._command_attempts,
+                self._temp_no_progress, self._cc_sent,
             )
             self._target_temp = NO_CHANGE_REQUESTED
             async with self._pending_lock:
@@ -933,12 +937,10 @@ class SpaClient:
             self._temp_done.set()
             return
 
-        if self._last_temp_seen is None:
-            self._last_temp_seen = current
-
         warmer = self._target_temp > current
         await self._send_temp_step(warmer)
         self._temp_check = CHECKS_BEFORE_RETRY
+
 
     async def _send_light_step(self, color: bool = False) -> None:
         """Licht: CC 0xF1 = Ein/Aus, CC 0xF2 = Farbe (Log 13:26 bestätigt)."""
@@ -1102,7 +1104,7 @@ class SpaClient:
             await asyncio.sleep(0.8)
 
     async def set_temperature(self, target: float) -> None:
-        """Soll-Temperatur: zuerst Direct-Set 0x20, sonst C6-Schritte (F0 47 / 52 E7)."""
+        """Soll-Temperatur geduldig per C6-Schritte bis Ziel erreicht."""
         target = max(20.0, min(40.0, round(target * 2) / 2.0))
         async with self._cmd_lock:
             snap = await self._status_snapshot()
@@ -1115,11 +1117,10 @@ class SpaClient:
             self._cc_queued = 0
             self._cc_sent = 0
             self._debug_cmd = True
-            self._last_logged_display = None
-            self._last_logged_set = None
             _LOGGER.warning(
-                "set_temperature START | Ziel=%.1f aktuell=%.1f kanal=0x%02X raw_d8=%s",
-                target, snap["set_temp"], ch, snap.get("raw_d8"),
+                "set_temperature START | Ziel=%.1f aktuell=%.1f kanal=0x%02X "
+                "(geduldige C6-Schleife, kein Abbruch bei Langsamkeit)",
+                target, snap["set_temp"], ch,
             )
             if snap.get("in_menu"):
                 await self._queue_cc(BTN_MENU)
@@ -1128,28 +1129,22 @@ class SpaClient:
             await self._ensure_temp_range(target, snap["raw_d8"])
             await self._wait_pending_clear()
 
-            # ── 1) Direct-Set (ein Paket = kompletter Sollwert) ───────────
-            for attempt in range(3):
+            # Optional 1× Direct-Set (schadet nicht, oft wirkungslos)
+            try:
                 pkt = _build_set_temp(ch, target)
-                _LOGGER.warning(
-                    "Direct-Set 0x20 Versuch %d: Ziel=%.1f raw=%d pkt=%s",
-                    attempt + 1, target, int(round(target * 2)), pkt.hex(" "),
-                )
                 await self._queue_raw(pkt)
-                await self._wait_pending_clear(timeout=4.0)
-                await asyncio.sleep(2.5)
+                await self._wait_pending_clear(timeout=3.0)
+                await asyncio.sleep(1.5)
                 snap2 = await self._status_snapshot()
                 if snap2 and abs(snap2["set_temp"] - target) < 0.3:
-                    _LOGGER.warning(
-                        "Direct-Set OK: %.1f °C (Versuch %d)", target, attempt + 1
-                    )
+                    _LOGGER.warning("Direct-Set OK: %.1f °C", target)
                     self._debug_cmd = False
                     return
+                if snap2:
+                    snap = snap2
+            except Exception as exc:
+                _LOGGER.debug("Direct-Set übersprungen: %s", exc)
 
-            # ── 2) Fallback: C6-Schritte mit nur verifizierten Codes ──────
-            _LOGGER.warning(
-                "Direct-Set wirkte nicht – Fallback C6-Schritte (UP=F0 47, DOWN=52 E7)"
-            )
             self._temp_done.clear()
             self._temp_check = 0
             self._command_attempts = 0
@@ -1157,26 +1152,35 @@ class SpaClient:
             self._temp_up_idx = 0
             self._temp_down_idx = 0
             self._last_temp_idx = None
-            snap = await self._status_snapshot() or snap
             self._last_temp_seen = snap["set_temp"]
             self._temp_start = snap["set_temp"]
             self._target_temp = target
             async with self._pending_lock:
                 self._pending.clear()
+
             steps = abs(target - snap["set_temp"]) / 0.5
-            timeout = max(120.0, steps * 8.0 + 30.0)
+            # Großzügig: ~8 s pro 0,5°-Schritt + Puffer
+            timeout = max(180.0, steps * 12.0 + 60.0)
             await self._handle_temp_feedback(snap)
             try:
                 await asyncio.wait_for(self._temp_done.wait(), timeout=timeout)
             except asyncio.TimeoutError as exc:
                 final = await self._status_snapshot()
                 got = final["set_temp"] if final else None
+                # Teil-Erfolg: wenn näher dran als Start, trotzdem melden
+                if got is not None and abs(got - target) < abs(self._temp_start - target) - 0.2:
+                    _LOGGER.warning(
+                        "set_temperature Teil-Erfolg | Start=%.1f jetzt=%.1f Ziel=%.1f "
+                        "– Timeout, aber Fortschritt war da",
+                        self._temp_start, got, target,
+                    )
                 _LOGGER.error(
-                    "set_temperature TIMEOUT | Ziel=%.1f got=%s sent=%d last=%s",
-                    target, got, self._cc_sent, self._last_cc_hex,
+                    "set_temperature TIMEOUT | Ziel=%.1f got=%s sent=%d attempts=%d",
+                    target, got, self._cc_sent, self._command_attempts,
                 )
                 raise UpdateFailed(
-                    f"Soll {target:.1f} °C nicht erreicht (aktuell {got})"
+                    f"Soll {target:.1f} °C nicht vollständig erreicht "
+                    f"(aktuell {got}, Start {self._temp_start})"
                 ) from exc
             finally:
                 self._target_temp = NO_CHANGE_REQUESTED
