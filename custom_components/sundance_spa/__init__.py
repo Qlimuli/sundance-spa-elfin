@@ -62,7 +62,7 @@ CC_REQ_ALT         = 0x17
 
 DETECT_CHANNEL_CYCLES = 5
 CHECKS_BEFORE_RETRY   = 6   # Status-Pakete zwischen Temp-Schritten
-TEMP_STEP_MIN_S       = 1.5 # Mindestabstand zwischen zwei C6-Temp-Befehlen
+TEMP_STEP_MIN_S       = 2.0 # Mindestabstand – Status braucht Zeit zum Setzen
 NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
 MAX_COMMAND_ATTEMPTS  = 24  # harte Obergrenze (kein Bus-Spam)
@@ -179,20 +179,18 @@ BLOWER_CC_BTN = 53
 BLOWER_CC_B6  = 217
 BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
 
-# Cameo iTouch: Temp über 0xC6 auf Kanal 0x10. Mehrere Sniff-Paare rotieren.
+# Cameo iTouch Temp 0xC6 auf Kanal 0x10.
+# NUR bestätigte Wärmer/Kühler-Paare aus Panel-Sniff (3× up, 3× down).
+# 0xFC/0x4F war KEIN Up – setzte Soll auf ~29°C zurück (Log 13:24)!
 TEMP_UP_C6: tuple[tuple[int, int], ...] = (
     (0x52, 0xE7),
     (0x49, 0xFF),
     (0xF0, 0x47),
-    (0xB2, 0x00),
-    (0xFC, 0x4F),
 )
 TEMP_DOWN_C6: tuple[tuple[int, int], ...] = (
     (0x97, 0x21),
     (0xEC, 0x59),
     (0xC8, 0x7C),
-    (0xE2, 0x56),
-    (0xCF, 0x7C),
 )
 # Fallback 0xCC (780/HyperActiveJ) – falls C6 nicht greift
 TEMP_UP_VARIANTS: tuple[tuple[int, int], ...] = (
@@ -886,27 +884,26 @@ class SpaClient:
         self._temp_check = CHECKS_BEFORE_RETRY
 
     async def _send_light_step(self, color: bool = False) -> None:
-        """Licht-Schritt: nur CC 241/242 (+ gelernte echte Licht-CCs). Nie C6."""
-        variants: list[tuple[int, int, int]] = list(
-            LIGHT_COLOR_VARIANTS if color else LIGHT_ON_VARIANTS
-        )
-        for v in self._learned_light:
-            if v[0] == CC_REQ and v not in variants:
-                variants.append(v)
-        mtype, btn, b6 = variants[self._light_attempt % len(variants)]
-        # Hartes Limit – kein Dauerfeuer
-        if self._light_attempt >= 8:
+        """Licht: CC 0xF1 = Ein/Aus, CC 0xF2 = Farbe (Log 13:26 bestätigt)."""
+        if color:
+            mtype, btn, b6 = CC_REQ, 0xF2, 0x00
+        else:
+            mtype, btn, b6 = CC_REQ, 0xF1, 0x00
+        if self._light_attempt >= 12:
             _LOGGER.error("Licht-Versuche erschöpft – Abbruch")
             self._target_light_brightness = LIGHT_NO_CHANGE
             self._target_light_mode = LIGHT_NO_CHANGE
+            async with self._pending_lock:
+                self._pending.clear()
             self._light_done.set()
             return
+        self._assigned_channel = CMD_CHANNEL
+        await self._wait_pending_clear(timeout=2.0)
         _LOGGER.warning(
-            "Licht-Schritt %s mtype=0x%02X btn=0x%02X b6=0x%02X attempt=%d",
+            "Licht-Schritt %s mtype=0x%02X btn=0x%02X attempt=%d ch=0x10",
             "COLOR" if color else "ON/OFF",
             mtype,
             btn,
-            b6,
             self._light_attempt + 1,
         )
         await self._queue_cc(btn, mtype, b6)
