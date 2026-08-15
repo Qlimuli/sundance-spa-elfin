@@ -61,8 +61,8 @@ CLIENT_TYPE_PANEL  = 0x02
 CC_REQ_ALT         = 0x17
 
 DETECT_CHANNEL_CYCLES = 5
-CHECKS_BEFORE_RETRY   = 12   # Status-Pakete zwischen Temp-Schritten
-TEMP_STEP_MIN_S       = 3.0 # Mindestabstand – Status braucht Zeit zum Setzen
+CHECKS_BEFORE_RETRY   = 6   # Status-Pakete zwischen Temp-Schritten
+TEMP_STEP_MIN_S       = 1.8 # Mindestabstand – Status braucht Zeit zum Setzen
 NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
 MAX_COMMAND_ATTEMPTS  = 80  # harte Obergrenze (kein Bus-Spam)
@@ -179,17 +179,32 @@ BLOWER_CC_BTN = 53
 BLOWER_CC_B6  = 217
 BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
 
-# Cameo C6 – Richtung aus Log 13:51–13:56 (aktuell!):
-#   F0 47 = UP (+1°),  52 E7 = DOWN (−0,5…1°),  49 FF = DOWN
-# Statische C6 sind fragil → primär Direct-Set 0x20, C6 nur Fallback.
-TEMP_UP_C6: tuple[tuple[int, int], ...] = (
-    (0xF0, 0x47),
+# Alle jemals wirksamen Temp-Payloads (Richtung wechselt – Rotation!)
+# Format: (mtype, btn, b6)
+TEMP_UP_CODES: tuple[tuple[int, int, int], ...] = (
+    (0xC6, 0xF0, 0x47),  # Log: UP
+    (0xC6, 0x52, 0xE7),  # mal UP, mal DOWN
+    (0xC6, 0x49, 0xFF),
+    (0xC6, 0xB2, 0x00),
+    (0xCC, 225, 0),      # HyperActiveJ Klartext TEMP_UP
+    (0xCC, 18, 242),     # XOR-Paar → 225
+    (0xCC, 19, 243),
+    (0x17, 0x01, 0),     # Jacuzzi-Alt Temp Up
 )
-TEMP_DOWN_C6: tuple[tuple[int, int], ...] = (
-    (0x52, 0xE7),
-    (0x49, 0xFF),
+TEMP_DOWN_CODES: tuple[tuple[int, int, int], ...] = (
+    (0xC6, 0x52, 0xE7),
+    (0xC6, 0x49, 0xFF),
+    (0xC6, 0x97, 0x21),
+    (0xC6, 0xEC, 0x59),
+    (0xC6, 0xC8, 0x7C),
+    (0xCC, 226, 0),      # Klartext TEMP_DOWN
+    (0xCC, 0, 227),
+    (0x17, 0x02, 0),     # Jacuzzi-Alt Temp Down
 )
-MSG_SET_TEMP = 0x20  # Jacuzzi/Balboa Direkt-Solltemperatur
+MSG_SET_TEMP = 0x20
+# Compat aliases
+TEMP_UP_C6 = tuple((b, x) for m, b, x in TEMP_UP_CODES if m == 0xC6)
+TEMP_DOWN_C6 = tuple((b, x) for m, b, x in TEMP_DOWN_CODES if m == 0xC6)
 # Fallback 0xCC (780/HyperActiveJ) – falls C6 nicht greift
 TEMP_UP_VARIANTS: tuple[tuple[int, int], ...] = (
     (BTN_TEMP_UP, 0),
@@ -723,11 +738,10 @@ class SpaClient:
                     self._pending.pop(idx)
                     self._cc_sent += 1
                     self._last_cc_hex = pkt.hex(" ")
-                    _LOGGER.info(
-                        "CC WIRKLICH GESENDET auf 0x%02X (sent=%d queued=%d): %s",
+                    _LOGGER.warning(
+                        "TX GESENDET ch=0x%02X sent=%d: %s",
                         channel,
                         self._cc_sent,
-                        self._cc_queued,
                         self._last_cc_hex,
                     )
                     return
@@ -835,46 +849,44 @@ class SpaClient:
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Ein 0,5°-Schritt. Nutzt nur verifizierte C6-Codes; nach Erfolg denselben Code behalten."""
+        """Einen Temp-Schritt senden – rotiert durch alle bekannten Codes."""
+        codes = TEMP_UP_CODES if warmer else TEMP_DOWN_CODES
+        idx = self._command_attempts % len(codes)
+        mtype, btn, b6 = codes[idx]
         label = "TEMP_UP" if warmer else "TEMP_DOWN"
-        pairs = TEMP_UP_C6 if warmer else TEMP_DOWN_C6
-        # Bei bekanntem funktionierendem Index diesen halten, sonst rotieren
-        if warmer and self._temp_up_idx is not None:
-            idx = self._temp_up_idx % len(pairs)
-        elif (not warmer) and self._temp_down_idx is not None:
-            idx = self._temp_down_idx % len(pairs)
-        else:
-            idx = self._command_attempts % len(pairs)
-        btn, b6 = pairs[idx]
         self._assigned_channel = CMD_CHANNEL
         now = time.monotonic()
         wait = TEMP_STEP_MIN_S - (now - self._last_temp_cmd_ts)
         if wait > 0:
             await asyncio.sleep(wait)
-        await self._wait_pending_clear(timeout=2.0)
+        await self._wait_pending_clear(timeout=2.5)
         _LOGGER.warning(
-            "Temp-Schritt %s C6[%d] btn=0x%02X b6=0x%02X attempt=%d ch=0x10",
-            label, idx, btn, b6, self._command_attempts + 1,
+            "Temp-Schritt %s code[%d/%d] mtype=0x%02X btn=0x%02X b6=0x%02X "
+            "attempt=%d ch=0x10 pending=%d",
+            label, idx, len(codes), mtype, btn, b6,
+            self._command_attempts + 1,
+            len(self._pending),
         )
         self._last_temp_idx = idx
         self._last_temp_warmer = warmer
-        await self._queue_cc(btn, C6_REQ, b6)
+        await self._queue_cc(btn, mtype, b6)
         self._last_temp_cmd_ts = time.monotonic()
         self._command_attempts += 1
 
+
     async def _handle_temp_feedback(self, status: dict) -> None:
-        """Geduldige Temp-Schleife: pro gesendetem Schritt warten, bis Status sich ändert."""
+        """Temp-Feedback: bei Fortschritt weiter, sonst nächsten Code – geduldig."""
         if self._temp_check > 0:
             self._temp_check -= 1
         if self._temp_check > 0 or self._target_temp == NO_CHANGE_REQUESTED:
             return
 
-        current = status["set_temp"]
+        current = float(status["set_temp"])
+        raw_d8 = status.get("raw_d8")
+        display = status.get("display")
+
         if abs(current - self._target_temp) < 0.3:
             self._target_temp = NO_CHANGE_REQUESTED
-            self._command_attempts = 0
-            self._temp_no_progress = 0
-            self._last_temp_seen = current
             self._temp_done.set()
             _LOGGER.warning(
                 "Soll-Temperatur erreicht: %.1f °C | sent=%d attempts=%d",
@@ -885,51 +897,47 @@ class SpaClient:
         if self._last_temp_seen is None:
             self._last_temp_seen = current
 
-        prev_err = abs(self._target_temp - self._last_temp_seen)
-        cur_err = abs(self._target_temp - current)
-        moved = abs(current - self._last_temp_seen) >= 0.25
+        prev = self._last_temp_seen
+        delta = current - prev
+        err_prev = abs(self._target_temp - prev)
+        err_now = abs(self._target_temp - current)
+        moved = abs(delta) >= 0.25
 
-        if moved and cur_err < prev_err - 0.15:
-            # Echter Fortschritt Richtung Ziel
+        if moved and err_now < err_prev - 0.15:
             _LOGGER.warning(
-                "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) – weiter…",
-                self._last_temp_seen, current, self._target_temp,
+                "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) raw_d8=%s display=%s "
+                "last_code_idx=%s – weiter",
+                prev, current, self._target_temp, raw_d8, display,
+                self._last_temp_idx,
             )
             self._temp_no_progress = 0
             self._last_temp_seen = current
-            # Kurze Pause, dann nächsten Schritt
-            self._temp_check = max(CHECKS_BEFORE_RETRY, 6)
-            warmer = self._target_temp > current
-            await self._send_temp_step(warmer)
-            return
-
-        if moved and cur_err > prev_err + 0.15:
-            # Falsche Richtung – Code merken und weitermachen (nicht abbrechen)
+        elif moved:
             _LOGGER.warning(
-                "Temp-Gegenrichtung: %.1f → %.1f (Ziel %.1f) – korrigiere",
-                self._last_temp_seen, current, self._target_temp,
+                "Temp-Bewegung GEGEN Ziel: %.1f → %.1f (Ziel %.1f) idx=%s",
+                prev, current, self._target_temp, self._last_temp_idx,
             )
             self._last_temp_seen = current
             self._temp_no_progress += 1
-        elif not moved:
-            # Kein Status-Update nach letztem Befehl – erneut senden (geduldig)
+        else:
             self._temp_no_progress += 1
-            _LOGGER.warning(
-                "Temp warte/retry | aktuell=%.1f Ziel=%.1f no_change=%d attempts=%d",
-                current, self._target_temp, self._temp_no_progress,
-                self._command_attempts,
-            )
+            if self._temp_no_progress % 5 == 1 or self._temp_no_progress <= 3:
+                _LOGGER.warning(
+                    "Temp no_change | set=%.1f ziel=%.1f raw_d8=%s display=%s "
+                    "no_change=%d attempts=%d sent=%d last_tx=%s",
+                    current, self._target_temp, raw_d8, display,
+                    self._temp_no_progress, self._command_attempts,
+                    self._cc_sent, self._last_cc_hex,
+                )
 
-        # Sehr geduldig: erst nach vielen erfolglosen Versuchen aufgeben
         steps_left = abs(self._target_temp - current) / 0.5
-        max_att = max(MAX_COMMAND_ATTEMPTS, int(steps_left) * 20 + 30)
-        max_stall = max(40, int(steps_left) * 15)
-        if self._command_attempts >= max_att and self._temp_no_progress >= max_stall:
+        max_att = max(MAX_COMMAND_ATTEMPTS, int(steps_left) * 25 + 40)
+        if self._command_attempts >= max_att:
             _LOGGER.error(
                 "Temperatur abgebrochen | aktuell=%.1f Ziel=%.1f attempts=%d "
-                "no_change=%d sent=%d (System zu langsam oder Codes wirkungslos)",
+                "sent=%d last_tx=%s",
                 current, self._target_temp, self._command_attempts,
-                self._temp_no_progress, self._cc_sent,
+                self._cc_sent, self._last_cc_hex,
             )
             self._target_temp = NO_CHANGE_REQUESTED
             async with self._pending_lock:
