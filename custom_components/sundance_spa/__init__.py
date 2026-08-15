@@ -179,19 +179,17 @@ BLOWER_CC_BTN = 53
 BLOWER_CC_B6  = 217
 BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
 
-# Cameo C6 Temp – Richtungen aus Log 13:37–13:38 verifiziert:
-#   52 E7 = UP,  F0 47 = UP,  49 FF = DOWN (nicht Up!)
-#   97 21 = DOWN (Panel-Sniff Kühler)
+# Cameo C6 – Richtung aus Log 13:51–13:56 (aktuell!):
+#   F0 47 = UP (+1°),  52 E7 = DOWN (−0,5…1°),  49 FF = DOWN
+# Statische C6 sind fragil → primär Direct-Set 0x20, C6 nur Fallback.
 TEMP_UP_C6: tuple[tuple[int, int], ...] = (
-    (0x52, 0xE7),
     (0xF0, 0x47),
 )
 TEMP_DOWN_C6: tuple[tuple[int, int], ...] = (
+    (0x52, 0xE7),
     (0x49, 0xFF),
-    (0x97, 0x21),
-    (0xEC, 0x59),
-    (0xC8, 0x7C),
 )
+MSG_SET_TEMP = 0x20  # Jacuzzi/Balboa Direkt-Solltemperatur
 # Fallback 0xCC (780/HyperActiveJ) – falls C6 nicht greift
 TEMP_UP_VARIANTS: tuple[tuple[int, int], ...] = (
     (BTN_TEMP_UP, 0),
@@ -206,6 +204,24 @@ TEMP_DOWN_VARIANTS: tuple[tuple[int, int], ...] = (
 TEMP_RANGE_HI_CC_BTN = 141
 TEMP_RANGE_HI_CC_B6  = 69
 BTN_MENU = 254
+
+
+
+def _build_set_temp(channel: int, celsius: float) -> bytes:
+    """Direkt-Solltemperatur (Msg 0x20). Wert = °C × 2 (halbe Grad)."""
+    val = int(round(celsius * 2.0))
+    val = max(40, min(80, val))  # 20.0 … 40.0 °C
+    ml = 6
+    msg = bytearray(8)
+    msg[0] = M_STARTEND
+    msg[1] = ml
+    msg[2] = channel & 0xFF
+    msg[3] = 0xBF
+    msg[4] = MSG_SET_TEMP
+    msg[5] = val & 0xFF
+    msg[6] = _calc_cs(msg[1:ml], ml - 1)
+    msg[7] = M_STARTEND
+    return bytes(msg)
 
 
 def _build_channel_request() -> bytes:
@@ -784,6 +800,36 @@ class SpaClient:
             pkt.hex(" "),
         )
 
+
+    async def _queue_raw(self, pkt: bytes) -> None:
+        """Reiht ein fertiges Paket ein (z.B. Direct-Set 0x20)."""
+        ch = await self._ensure_channel()
+        # Kanal im Paket ggf. anpassen (Byte 2)
+        if len(pkt) > 2:
+            ba = bytearray(pkt)
+            ba[2] = ch & 0xFF
+            # Checksum neu (ml = ba[1], cs an Position ml)
+            ml = ba[1]
+            if len(ba) > ml:
+                ba[ml] = _calc_cs(ba[1:ml], ml - 1)
+            pkt = bytes(ba)
+        waited = 0.0
+        while waited < PENDING_WAIT_S:
+            async with self._pending_lock:
+                if len(self._pending) < MAX_PENDING_CC:
+                    self._pending.append((ch, pkt))
+                    self._cc_queued += 1
+                    _LOGGER.warning(
+                        "RAW eingeplant ch=0x%02X: %s", ch, pkt.hex(" ")
+                    )
+                    return
+            await asyncio.sleep(0.1)
+            waited += 0.1
+        async with self._pending_lock:
+            if len(self._pending) < MAX_PENDING_CC:
+                self._pending.append((ch, pkt))
+                self._cc_queued += 1
+
     async def send_blower_toggle(self) -> None:
         """Blubber ein/aus – verschlüsseltes Panel-CC (53/217)."""
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
@@ -1056,8 +1102,8 @@ class SpaClient:
             await asyncio.sleep(0.8)
 
     async def set_temperature(self, target: float) -> None:
-        """Soll-Temperatur per TEMP_UP/TEMP_DOWN-Tasten (Feedback-Schleife)."""
-        target = max(20.0, min(40.0, target))
+        """Soll-Temperatur: zuerst Direct-Set 0x20, sonst C6-Schritte (F0 47 / 52 E7)."""
+        target = max(20.0, min(40.0, round(target * 2) / 2.0))
         async with self._cmd_lock:
             snap = await self._status_snapshot()
             if not snap:
@@ -1071,72 +1117,71 @@ class SpaClient:
             self._debug_cmd = True
             self._last_logged_display = None
             self._last_logged_set = None
-            _LOGGER.info(
-                "set_temperature START | Ziel=%.1f aktuell=%.1f | "
-                "kanal=0x%02X raw_d8=%s display=%s in_menu=%s "
-                "p1=%s p2=%s cts_own_bisher=%d discovered=%s active=%s",
-                target,
-                snap["set_temp"],
-                ch,
-                snap["raw_d8"],
-                snap.get("display"),
-                snap.get("in_menu"),
-                snap.get("pump1"),
-                snap.get("pump2"),
-                self._cts_own,
-                [f"0x{c:02X}" for c in self._discovered_channels],
-                [f"0x{c:02X}" for c in self._active_channels],
+            _LOGGER.warning(
+                "set_temperature START | Ziel=%.1f aktuell=%.1f kanal=0x%02X raw_d8=%s",
+                target, snap["set_temp"], ch, snap.get("raw_d8"),
             )
             if snap.get("in_menu"):
-                _LOGGER.info("Panel im Menü – sende MENU-Exit (254)")
                 await self._queue_cc(BTN_MENU)
                 await self._wait_pending_clear()
             await self._ensure_pumps_off_for_heating()
             await self._ensure_temp_range(target, snap["raw_d8"])
             await self._wait_pending_clear()
+
+            # ── 1) Direct-Set (ein Paket = kompletter Sollwert) ───────────
+            for attempt in range(3):
+                pkt = _build_set_temp(ch, target)
+                _LOGGER.warning(
+                    "Direct-Set 0x20 Versuch %d: Ziel=%.1f raw=%d pkt=%s",
+                    attempt + 1, target, int(round(target * 2)), pkt.hex(" "),
+                )
+                await self._queue_raw(pkt)
+                await self._wait_pending_clear(timeout=4.0)
+                await asyncio.sleep(2.5)
+                snap2 = await self._status_snapshot()
+                if snap2 and abs(snap2["set_temp"] - target) < 0.3:
+                    _LOGGER.warning(
+                        "Direct-Set OK: %.1f °C (Versuch %d)", target, attempt + 1
+                    )
+                    self._debug_cmd = False
+                    return
+
+            # ── 2) Fallback: C6-Schritte mit nur verifizierten Codes ──────
+            _LOGGER.warning(
+                "Direct-Set wirkte nicht – Fallback C6-Schritte (UP=F0 47, DOWN=52 E7)"
+            )
             self._temp_done.clear()
             self._temp_check = 0
             self._command_attempts = 0
             self._temp_no_progress = 0
-            self._temp_up_idx = None
-            self._temp_down_idx = None
+            self._temp_up_idx = 0
+            self._temp_down_idx = 0
             self._last_temp_idx = None
+            snap = await self._status_snapshot() or snap
             self._last_temp_seen = snap["set_temp"]
             self._temp_start = snap["set_temp"]
             self._target_temp = target
             async with self._pending_lock:
                 self._pending.clear()
             steps = abs(target - snap["set_temp"]) / 0.5
-            timeout = max(90.0, steps * 6.0 + 20.0)
+            timeout = max(120.0, steps * 8.0 + 30.0)
             await self._handle_temp_feedback(snap)
-
             try:
                 await asyncio.wait_for(self._temp_done.wait(), timeout=timeout)
             except asyncio.TimeoutError as exc:
                 final = await self._status_snapshot()
                 got = final["set_temp"] if final else None
                 _LOGGER.error(
-                    "set_temperature TIMEOUT | Ziel=%.1f got=%s | "
-                    "kanal=0x%02X cts_own=%d queued=%d sent=%d last_cc=%s",
-                    target,
-                    got,
-                    ch,
-                    self._cts_own,
-                    self._cc_queued,
-                    self._cc_sent,
-                    self._last_cc_hex,
+                    "set_temperature TIMEOUT | Ziel=%.1f got=%s sent=%d last=%s",
+                    target, got, self._cc_sent, self._last_cc_hex,
                 )
                 raise UpdateFailed(
-                    f"Soll-Temperatur konnte nicht auf {target:.1f} °C gesetzt werden "
-                    f"(aktuell: {got} °C, Kanal 0x{ch:02X}, "
-                    f"CTS={self._cts_own}, gesendet={self._cc_sent}/{self._cc_queued}). "
-                    "Prüfen Sie Temperatur-Sperre am Panel und HA-Log auf "
-                    "'CC WIRKLICH GESENDET'."
+                    f"Soll {target:.1f} °C nicht erreicht (aktuell {got})"
                 ) from exc
             finally:
                 self._target_temp = NO_CHANGE_REQUESTED
-                self._command_attempts = 0
                 self._debug_cmd = False
+
 
     async def set_light(
         self,
@@ -1239,7 +1284,7 @@ class SpaCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(seconds=10),  # weniger HA-Last
+            update_interval=timedelta(seconds=5),
         )
         self.client = client
         self._heal_failures = 0
