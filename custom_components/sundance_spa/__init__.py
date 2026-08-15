@@ -416,6 +416,10 @@ class SpaClient:
         self._light_attempt = 0
         self._debug_cmd = False
         self._recent_tx: set = set()
+        self._learned_c6_up: list = []
+        self._learned_c6_down: list = []
+        self._panel_c6_recent: list = []  # (ts, btn, b6)
+        self._last_set_temp_seen: float | None = None
         self._sniff_panel_cc = True
         self._last_logged_display: int | None = None
         self._last_logged_set: float | None = None
@@ -643,10 +647,15 @@ class SpaClient:
                     raw_hex = msg.hex(" ")
                     recent = getattr(self, "_recent_tx", set())
                     if raw_hex not in recent:
+                        btn, b6 = msg[5], msg[6]
                         _LOGGER.warning(
-                            "PANEL-SNIFF C6 | ch=0x%02X btn=0x%02X b6=0x%02X raw=%s",
-                            channel, msg[5], msg[6], raw_hex,
+                            "PANEL-SNIFF C6 | ch=0x%02X btn=0x%02X b6=0x%02X "
+                            "xor=0x%02X raw=%s",
+                            channel, btn, b6, btn ^ b6, raw_hex,
                         )
+                        self._panel_c6_recent.append((time.monotonic(), btn, b6))
+                        if len(self._panel_c6_recent) > 80:
+                            self._panel_c6_recent = self._panel_c6_recent[-60:]
                 elif self._debug_cmd:
                     _LOGGER.debug(
                         "BUS-MSG unbekannt | ch=0x%02X mtype=0x%02X raw=%s",
@@ -685,6 +694,8 @@ class SpaClient:
                                 dec.get("pump1"),
                                 dec.get("pump2"),
                             )
+                    if dec.get("set_temp") is not None:
+                        self._learn_c6_from_settemp(float(dec["set_temp"]))
                     await self._handle_temp_feedback(dec)
 
             elif mtype in (LIGHTS_UPDATE, LIGHTS_UPDATE_ALT):
@@ -867,26 +878,66 @@ class SpaClient:
         """Blubber ein/aus – verschlüsseltes Panel-CC (53/217)."""
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
+
+    def _learn_c6_from_settemp(self, new_set: float) -> None:
+        """Ordnet kürzliche Panel-C6 der Richtung der Soll-Änderung zu."""
+        prev = self._last_set_temp_seen
+        self._last_set_temp_seen = new_set
+        if prev is None:
+            return
+        delta = new_set - prev
+        if abs(delta) < 0.25:
+            return
+        now = time.monotonic()
+        # Panel-Codes der letzten 2 s
+        recent = [
+            (b, x) for (ts, b, x) in self._panel_c6_recent
+            if now - ts < 2.0
+        ]
+        if not recent:
+            return
+        # Nimm den neuesten Code
+        btn, b6 = recent[-1]
+        entry = (0xC6, btn, b6)
+        if delta > 0:
+            if entry not in self._learned_c6_up:
+                self._learned_c6_up.append(entry)
+                if len(self._learned_c6_up) > 30:
+                    self._learned_c6_up = self._learned_c6_up[-25:]
+            _LOGGER.warning(
+                "LEARN-UP C6 btn=0x%02X b6=0x%02X (set %.1f→%.1f) pool=%d",
+                btn, b6, prev, new_set, len(self._learned_c6_up),
+            )
+        else:
+            if entry not in self._learned_c6_down:
+                self._learned_c6_down.append(entry)
+                if len(self._learned_c6_down) > 30:
+                    self._learned_c6_down = self._learned_c6_down[-25:]
+            _LOGGER.warning(
+                "LEARN-DOWN C6 btn=0x%02X b6=0x%02X (set %.1f→%.1f) pool=%d",
+                btn, b6, prev, new_set, len(self._learned_c6_down),
+            )
+
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Temp-Frame auf dem *zugewiesenen* Kanal (kein Zwang auf 0x10)."""
-        codes = list(TEMP_UP_CODES if warmer else TEMP_DOWN_CODES)
-        bl = self._temp_blacklist_up if warmer else self._temp_blacklist_down
+        """Bevorzugt gelernte Panel-C6, sonst Fallback-Codes."""
+        if warmer:
+            codes = list(self._learned_c6_up) or list(TEMP_UP_CODES)
+            bl = self._temp_blacklist_up
+        else:
+            codes = list(self._learned_c6_down) or list(TEMP_DOWN_CODES)
+            bl = self._temp_blacklist_down
         filtered = [c for c in codes if c not in bl]
         if not filtered:
-            bl.clear()
-            filtered = list(codes)
+            filtered = list(TEMP_UP_CODES if warmer else TEMP_DOWN_CODES)
         codes = filtered
 
         idx = int(getattr(self, "_temp_code_idx", 0)) % len(codes)
         mtype, btn, b6 = codes[idx]
         label = "TEMP_UP" if warmer else "TEMP_DOWN"
-
-        # Nur Fallback wenn kein Kanal – nie hart überschreiben
         ch = self._assigned_channel
         if ch is None:
             ch = CMD_CHANNEL
             self._assigned_channel = ch
-            _LOGGER.warning("Temp-Schritt: kein Kanal → Fallback 0x%02X", ch)
 
         now = time.monotonic()
         wait = TEMP_STEP_MIN_S - (now - self._last_temp_cmd_ts)
@@ -894,15 +945,17 @@ class SpaClient:
             await asyncio.sleep(wait)
         await self._wait_pending_clear(timeout=3.0)
 
+        src = "learned" if (
+            (warmer and self._learned_c6_up) or ((not warmer) and self._learned_c6_down)
+        ) else "fallback"
         _LOGGER.warning(
-            "Temp-Schritt %s idx=%d/%d mtype=0x%02X btn=0x%02X b6=0x%02X "
-            "attempt=%d steps_ok=%d ch=0x%02X disc=%s active=%s",
-            label, idx, len(codes), mtype, btn, b6,
+            "Temp-Schritt %s [%s] idx=%d/%d btn=0x%02X b6=0x%02X "
+            "attempt=%d steps_ok=%d learn_up=%d learn_dn=%d",
+            label, src, idx, len(codes), btn, b6,
             self._command_attempts + 1,
             getattr(self, "_temp_steps_done", 0),
-            ch,
-            [f"0x{c:02X}" for c in self._discovered_channels],
-            [f"0x{c:02X}" for c in self._active_channels],
+            len(self._learned_c6_up),
+            len(self._learned_c6_down),
         )
         self._last_temp_idx = idx
         self._last_temp_code = (mtype, btn, b6)
@@ -910,7 +963,6 @@ class SpaClient:
         await self._queue_cc(btn, mtype, b6)
         self._last_temp_cmd_ts = time.monotonic()
         self._command_attempts += 1
-        # Nach jedem Send nächsten Code für Variation (Debounce)
         self._temp_code_idx = (idx + 1) % len(codes)
 
 
@@ -1238,15 +1290,12 @@ class SpaClient:
             self._temp_stall_rounds = 0
             # Bekannt schlechte UP-Codes von vornherein sperren
             # Nur Codes die Live als GEGEN-Richtung erwiesen sind
-            self._temp_blacklist_up = {
-                (0xC6, 0x52, 0xE7),
-                (0xC6, 0xB2, 0x00),
-            }
-            self._temp_blacklist_down = {
-                (0xC6, 0xF0, 0x47),
-                (0xC6, 0x52, 0xE7),
-                (0xC6, 0xB2, 0x00),
-            }
+            self._temp_blacklist_up = set()
+            self._temp_blacklist_down = set()
+            _LOGGER.warning(
+                "Learn-Pool: UP=%d DOWN=%d (aus Panel-Sniff)",
+                len(self._learned_c6_up), len(self._learned_c6_down),
+            )
             self._last_temp_code = None
             self._last_temp_seen = snap["set_temp"]
             self._temp_start = snap["set_temp"]
