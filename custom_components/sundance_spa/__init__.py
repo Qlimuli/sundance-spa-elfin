@@ -414,7 +414,9 @@ class SpaClient:
         self._last_status_ts = 0.0
         self._learned_light: list[tuple[int, int, int]] = []  # (mtype, btn, b6)
         self._light_attempt = 0
-        self._debug_cmd = False  # erhöhte Logs während Temp/Licht-Steuerung
+        self._debug_cmd = False
+        self._recent_tx: set = set()
+        self._sniff_panel_cc = True
         self._last_logged_display: int | None = None
         self._last_logged_set: float | None = None
         self._sniff_panel_cc = True  # Panel-Tasten (fremde Kanäle) immer loggen
@@ -547,10 +549,16 @@ class SpaClient:
                         [f"0x{c:02X}" for c in self._discovered_channels],
                     )
 
-                # Nur auf *unserem* Kanal senden (Referenz: channel == self.channel)
                 if self._assigned_channel is not None and channel == self._assigned_channel:
                     self._cts_own += 1
                     await self._flush_pending(channel)
+                elif (
+                    self._assigned_channel is not None
+                    and self._pending
+                    and len(self._discovered_channels) <= 2
+                ):
+                    # Cameo: manchmal CTS auf 0x11 während wir 0x10 nutzen
+                    await self._flush_pending(self._assigned_channel)
 
                 # Idle-Kanal wählen, falls noch kein Assignment
                 if self._detect_state < DETECT_CHANNEL_CYCLES:
@@ -579,40 +587,38 @@ class SpaClient:
                     ):
                         self._pick_idle_channel()
 
-                # Panel-Sniff: ALLE CC (auch ch 0x10 – Panel teilt oft denselben Kanal)
+                # Panel-Sniff: jedes CC das nicht unser Echo ist (auch ch 0x10)
                 if self._sniff_panel_cc and len(msg) >= 7:
                     btn_b5 = msg[5]
                     b6 = msg[6] if len(msg) > 6 else 0
                     decoded = btn_b5 ^ b6 ^ 1
+                    raw_hex = msg.hex(" ")
                     is_echo = (
                         self._last_cc_hex is not None
-                        and msg.hex(" ") == self._last_cc_hex
+                        and raw_hex == self._last_cc_hex
                     )
-                    if not is_echo and decoded != 224:  # BTN_NA
-                        src = (
-                            "EIGEN"
-                            if channel == self._assigned_channel
-                            else "PANEL"
-                        )
+                    if not is_echo:
+                        # Fremd = nicht in unseren letzten TX (auch gleicher Kanal!)
+                        recent = getattr(self, "_recent_tx", set())
+                        is_ours = raw_hex in recent
+                        src = "EIGEN" if is_ours else "PANEL"
                         if src == "PANEL":
                             if channel not in self._active_channels:
                                 self._active_channels.append(channel)
-                            # Nur echte Licht-CC merken (241/242), keine Temp-CCs
-                            if decoded in (241, 242, BTN_LIGHT, BTN_LIGHT_COLOR):
-                                entry = (mtype, btn_b5, b6)
-                                if entry not in self._learned_light:
-                                    self._learned_light.append(entry)
-                        _LOGGER.warning(
-                            "CC-TASTE %s | ch=0x%02X mtype=0x%02X "
-                            "btn=%d b6=%d dec=%d raw=%s",
-                            src,
-                            channel,
-                            mtype,
-                            btn_b5,
-                            b6,
-                            decoded,
-                            msg.hex(" "),
-                        )
+                            entry = (mtype, btn_b5, b6)
+                            # Temp-Codes lernen
+                            if not hasattr(self, "_learned_temp_up"):
+                                self._learned_temp_up = []
+                                self._learned_temp_down = []
+                            _LOGGER.warning(
+                                "PANEL-SNIFF CC | ch=0x%02X mtype=0x%02X "
+                                "btn=0x%02X b6=0x%02X dec=%d raw=%s",
+                                channel, mtype, btn_b5, b6, decoded, raw_hex,
+                            )
+                        else:
+                            _LOGGER.debug(
+                                "CC-Echo EIGEN | raw=%s", raw_hex,
+                            )
 
             # Unbekannte Message-Typen (Touch-Panel kann anderes nutzen)
             elif (
@@ -634,14 +640,13 @@ class SpaClient:
                 and len(msg) >= 5
             ):
                 if mtype == C6_REQ and len(msg) >= 7:
-                    # Immer loggen (Sniff für Licht/Temp) – nie auto-replayen
-                    _LOGGER.warning(
-                        "C6-PANEL | ch=0x%02X btn=0x%02X b6=0x%02X raw=%s",
-                        channel,
-                        msg[5],
-                        msg[6],
-                        msg.hex(" "),
-                    )
+                    raw_hex = msg.hex(" ")
+                    recent = getattr(self, "_recent_tx", set())
+                    if raw_hex not in recent:
+                        _LOGGER.warning(
+                            "PANEL-SNIFF C6 | ch=0x%02X btn=0x%02X b6=0x%02X raw=%s",
+                            channel, msg[5], msg[6], raw_hex,
+                        )
                 elif self._debug_cmd:
                     _LOGGER.debug(
                         "BUS-MSG unbekannt | ch=0x%02X mtype=0x%02X raw=%s",
@@ -730,23 +735,35 @@ class SpaClient:
             _LOGGER.info("Channel Fallback: 0x%02X", CMD_CHANNEL)
 
     async def _flush_pending(self, channel: int) -> None:
-        """Sendet genau ein wartendes CC-Paket auf dem CTS-Kanal (Halbduplex)."""
+        """Sendet ein wartendes Paket auf CTS-Kanal (oder beliebig wenn Solo-Kanal)."""
         assert self._writer is not None
         async with self._pending_lock:
+            if not self._pending:
+                return
+            # Primär exakter Kanal, sonst erstes Paket (Cameo oft nur 1 Kanal)
+            idx_send = None
             for idx, (pkt_ch, pkt) in enumerate(self._pending):
                 if pkt_ch == channel:
-                    self._writer.write(pkt)
-                    await self._writer.drain()
-                    self._pending.pop(idx)
-                    self._cc_sent += 1
-                    self._last_cc_hex = pkt.hex(" ")
-                    _LOGGER.warning(
-                        "TX GESENDET ch=0x%02X sent=%d: %s",
-                        channel,
-                        self._cc_sent,
-                        self._last_cc_hex,
-                    )
-                    return
+                    idx_send = idx
+                    break
+            if idx_send is None and len(self._discovered_channels) <= 1:
+                idx_send = 0
+            if idx_send is None:
+                return
+            pkt_ch, pkt = self._pending.pop(idx_send)
+            self._writer.write(pkt)
+            await self._writer.drain()
+            self._cc_sent += 1
+            self._last_cc_hex = pkt.hex(" ")
+            if not hasattr(self, "_recent_tx"):
+                self._recent_tx = set()
+            self._recent_tx.add(self._last_cc_hex)
+            if len(self._recent_tx) > 40:
+                self._recent_tx = set(list(self._recent_tx)[-20:])
+            _LOGGER.warning(
+                "TX GESENDET ch=0x%02X (pkt_ch=0x%02X) sent=%d: %s",
+                channel, pkt_ch, self._cc_sent, self._last_cc_hex,
+            )
 
     async def _write_direct(self, packet: bytes) -> None:
         if not self._writer:
