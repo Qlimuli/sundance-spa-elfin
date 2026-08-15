@@ -61,12 +61,13 @@ CLIENT_TYPE_PANEL  = 0x02
 CC_REQ_ALT         = 0x17
 
 DETECT_CHANNEL_CYCLES = 5
-CHECKS_BEFORE_RETRY   = 4   # Status-Pakete warten zwischen Temp-Schritten
+CHECKS_BEFORE_RETRY   = 6   # Status-Pakete zwischen Temp-Schritten
+TEMP_STEP_MIN_S       = 1.5 # Mindestabstand zwischen zwei C6-Temp-Befehlen
 NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
-MAX_COMMAND_ATTEMPTS  = 80  # große Sprünge (z.B. +10°C = 20 × 0,5)
-MAX_PENDING_CC        = 2   # kurze Sequenz (MENU → Temp) ohne Verwurf
-PENDING_WAIT_S        = 3.0 # max. Warten bis CTS den Slot freigibt
+MAX_COMMAND_ATTEMPTS  = 24  # harte Obergrenze (kein Bus-Spam)
+MAX_PENDING_CC        = 1   # nur 1 Befehl auf dem Bus – schont Panel
+PENDING_WAIT_S        = 4.0 # max. Warten bis CTS den Slot freigibt
 
 # ── Button-Codes ─────────────────────────────────────────────────────────────
 BTN_TEMP_UP        = 225
@@ -78,6 +79,17 @@ BTN_PUMP2          = 229
 BTN_CLEARRAY       = 239
 BTN_LIGHT          = 241
 BTN_LIGHT_COLOR    = 242
+# Cameo: Licht oft über CC 241/242; Panel kann C6 nutzen – Sniff lernt nach
+LIGHT_ON_VARIANTS: tuple[tuple[int, int, int], ...] = (
+    (CC_REQ, 241, 0),
+    (CC_REQ, 0xF1, 0x00),
+    (C6_REQ, 0xF1, 0x00),
+)
+LIGHT_COLOR_VARIANTS: tuple[tuple[int, int, int], ...] = (
+    (CC_REQ, 242, 0),
+    (CC_REQ, 0xF2, 0x00),
+    (C6_REQ, 0xF2, 0x00),
+)
 BTN_ZIRK           = 242
 BTN_BLOWER         = 237   # Klartext NICHT verwenden – steuert Pumpen; siehe BLOWER_CC_*
 
@@ -169,18 +181,10 @@ BLOWER_CC_BTN = 53
 BLOWER_CC_B6  = 217
 BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
 
-# Cameo iTouch: Temperatur läuft über Message-Typ 0xC6 (nicht 0xCC).
-# Payload-Paare aus Panel-Sniff 2026-08-15 (3× Wärmer, dann 3× Kühler).
-TEMP_UP_C6: tuple[tuple[int, int], ...] = (
-    (0x52, 0xE7),
-    (0x49, 0xFF),
-    (0xF0, 0x47),
-)
-TEMP_DOWN_C6: tuple[tuple[int, int], ...] = (
-    (0x97, 0x21),
-    (0xEC, 0x59),
-    (0xC8, 0x7C),
-)
+# Cameo iTouch: Temperatur über 0xC6 (Panel-Sniff 2026-08-15).
+# Nur JEWEILS ein stabiles Paar – Rotation mischte Up/Down und oszillierte.
+TEMP_UP_C6_BTN, TEMP_UP_C6_B6 = 0x52, 0xE7
+TEMP_DOWN_C6_BTN, TEMP_DOWN_C6_B6 = 0x97, 0x21
 # Fallback 0xCC (780/HyperActiveJ) – falls C6 nicht greift
 TEMP_UP_VARIANTS: tuple[tuple[int, int], ...] = (
     (BTN_TEMP_UP, 0),
@@ -359,6 +363,13 @@ class SpaClient:
         self._cts_own = 0
         self._last_cc_hex: str | None = None
         self._last_temp_seen: float | None = None
+        self._temp_start: float | None = None
+        self._temp_no_progress = 0
+        self._last_temp_cmd_ts = 0.0
+        self._last_rx_ts = 0.0
+        self._last_status_ts = 0.0
+        self._learned_light: list[tuple[int, int, int]] = []  # (mtype, btn, b6)
+        self._light_attempt = 0
         self._debug_cmd = False  # erhöhte Logs während Temp/Licht-Steuerung
         self._last_logged_display: int | None = None
         self._last_logged_set: float | None = None
@@ -386,13 +397,16 @@ class SpaClient:
         try:
             await asyncio.wait_for(self._channel_ready.wait(), timeout=15.0)
         except asyncio.TimeoutError:
-            # Letzter Fallback: festen Panel-Kanal 0x10 nutzen
-            self._assigned_channel = CMD_CHANNEL
-            self._channel_ready.set()
-            _LOGGER.warning(
-                "Kein Channel-Assignment innerhalb 15 s – Fallback auf 0x%02X",
-                CMD_CHANNEL,
-            )
+            # Nicht 0x10 erzwingen – das ist oft das iTouch-Panel (Bus-Konkurrenz)
+            self._pick_idle_channel()
+            if self._assigned_channel is None:
+                # Nächster freier Kanal ab 0x11
+                self._assigned_channel = 0x11
+                self._channel_ready.set()
+                _LOGGER.warning(
+                    "Kein CTS-Kanal entdeckt – nutze 0x11 (vermeide Panel 0x10)"
+                )
+        self._last_rx_ts = time.monotonic()
         _LOGGER.info(
             "Spa verbunden: %s:%s – Channel assigned: 0x%02X",
             self.host,
@@ -539,7 +553,12 @@ class SpaClient:
                             if channel == self._assigned_channel
                             else "PANEL"
                         )
-                        # WARNING: HA-Default-Logger zeigt INFO oft nicht
+                        if src == "PANEL":
+                            if channel not in self._active_channels:
+                                self._active_channels.append(channel)
+                            entry = (mtype, btn_b5, b6)
+                            if entry not in self._learned_light:
+                                self._learned_light.append(entry)
                         _LOGGER.warning(
                             "CC-TASTE %s | ch=0x%02X mtype=0x%02X "
                             "btn=%d b6=%d dec=%d raw=%s",
@@ -572,21 +591,37 @@ class SpaClient:
                 and len(msg) >= 5
             ):
                 if mtype == C6_REQ and len(msg) >= 7:
+                    if channel not in self._active_channels:
+                        self._active_channels.append(channel)
+                    # Kanalwechsel wenn wir denselben wie das Panel haben
+                    if (
+                        self._assigned_channel is not None
+                        and channel == self._assigned_channel
+                    ):
+                        _LOGGER.warning(
+                            "Panel-C6 auf unserem Kanal 0x%02X – wechsle Kanal",
+                            channel,
+                        )
+                        self._assigned_channel = None
+                        self._pick_idle_channel()
+                    btn, b6 = msg[5], msg[6]
+                    entry = (C6_REQ, btn, b6)
+                    if entry not in self._learned_light:
+                        self._learned_light.append(entry)
+                        if len(self._learned_light) > 20:
+                            self._learned_light.pop(0)
                     _LOGGER.warning(
                         "C6-PANEL | ch=0x%02X btn=0x%02X b6=0x%02X raw=%s",
                         channel,
-                        msg[5],
-                        msg[6],
+                        btn,
+                        b6,
                         msg.hex(" "),
                     )
-                else:
-                    _LOGGER.warning(
-                        "BUS-MSG unbekannt | ch=0x%02X mid=0x%02X mtype=0x%02X "
-                        "len=%d raw=%s",
+                elif self._debug_cmd:
+                    _LOGGER.debug(
+                        "BUS-MSG unbekannt | ch=0x%02X mtype=0x%02X raw=%s",
                         channel,
-                        msg[3] if len(msg) > 3 else 0,
                         mtype,
-                        len(msg),
                         msg.hex(" "),
                     )
 
@@ -597,6 +632,7 @@ class SpaClient:
                     async with self._lock:
                         self._status = dec
                         self._status_seq += 1
+                        self._last_status_ts = time.monotonic()
                     if self._debug_cmd:
                         dcode = dec.get("display_code")
                         st = dec.get("set_temp")
@@ -642,19 +678,30 @@ class SpaClient:
                     await self._handle_light_feedback(dec)
 
     def _pick_idle_channel(self) -> None:
-        """Wählt den ersten freigegebenen CTS-Kanal, der nicht von anderem Panel genutzt wird."""
-        for ch in sorted(self._discovered_channels):
-            if ch not in self._active_channels:
-                self._assigned_channel = ch
-                self._channel_ready.set()
-                _LOGGER.info(
-                    "Channel assigned: 0x%02X (idle CTS-Kanal, active=%s)",
-                    ch,
-                    [f"0x{c:02X}" for c in self._active_channels],
-                )
-                return
+        """Wählt CTS-Kanal, der nicht vom iTouch-Panel genutzt wird (0x10 meiden)."""
+        avoid = set(self._active_channels) | {0x10}  # 0x10 = typisch Cameo-Panel
+        candidates = sorted(
+            ch for ch in self._discovered_channels if ch not in avoid
+        )
+        if not candidates:
+            # Fallback: irgendein discovered außer active
+            candidates = sorted(
+                ch for ch in self._discovered_channels
+                if ch not in self._active_channels
+            )
+        if candidates:
+            ch = candidates[0]
+            self._assigned_channel = ch
+            self._channel_ready.set()
+            _LOGGER.info(
+                "Channel assigned: 0x%02X (idle, avoid=%s discovered=%s)",
+                ch,
+                [f"0x{c:02X}" for c in sorted(avoid)],
+                [f"0x{c:02X}" for c in self._discovered_channels],
+            )
+            return
         _LOGGER.warning(
-            "Kein freier Kanal gefunden (discovered=%s, active=%s) – warte weiter",
+            "Kein freier Kanal (discovered=%s, active=%s) – warte weiter",
             [f"0x{c:02X}" for c in self._discovered_channels],
             [f"0x{c:02X}" for c in self._active_channels],
         )
@@ -752,28 +799,32 @@ class SpaClient:
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Ein 0,5°-Schritt per Cameo-C6 (keine CC-Fallbacks – die greifen hier nicht)."""
+        """Ein 0,5°-Schritt per Cameo-C6 – nur ein festes Payload-Paar je Richtung."""
         label = "TEMP_UP" if warmer else "TEMP_DOWN"
-        c6 = TEMP_UP_C6 if warmer else TEMP_DOWN_C6
-        # Nach Fortschritt immer wieder mit dem ersten erfolgreichen Muster starten
-        idx = self._command_attempts % len(c6)
-        btn, b6 = c6[idx]
+        if warmer:
+            btn, b6 = TEMP_UP_C6_BTN, TEMP_UP_C6_B6
+        else:
+            btn, b6 = TEMP_DOWN_C6_BTN, TEMP_DOWN_C6_B6
+        now = time.monotonic()
+        wait = TEMP_STEP_MIN_S - (now - self._last_temp_cmd_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        # Pending leeren, bevor neuer Befehl → kein Stau, Panel atmet
+        await self._wait_pending_clear(timeout=2.0)
         _LOGGER.info(
-            "Temp-Schritt %s C6[%d] btn=0x%02X b6=0x%02X attempt=%d "
-            "kanal=0x%02X sent=%d",
+            "Temp-Schritt %s C6 btn=0x%02X b6=0x%02X attempt=%d sent=%d",
             label,
-            idx,
             btn,
             b6,
             self._command_attempts + 1,
-            self._assigned_channel or 0,
             self._cc_sent,
         )
         await self._queue_cc(btn, C6_REQ, b6)
+        self._last_temp_cmd_ts = time.monotonic()
         self._command_attempts += 1
 
     async def _handle_temp_feedback(self, status: dict) -> None:
-        """Feedback-Schleife: je 0,5° C6, bei Fortschritt Attempts zurücksetzen."""
+        """Feedback: nur Fortschritt ZUM Ziel zählt; sonst Abort gegen Oszillation."""
         if self._temp_check > 0:
             self._temp_check -= 1
         if self._temp_check > 0 or self._target_temp == NO_CHANGE_REQUESTED:
@@ -783,6 +834,7 @@ class SpaClient:
         if abs(current - self._target_temp) < 0.3:
             self._target_temp = NO_CHANGE_REQUESTED
             self._command_attempts = 0
+            self._temp_no_progress = 0
             self._last_temp_seen = current
             self._temp_done.set()
             _LOGGER.warning(
@@ -792,33 +844,50 @@ class SpaClient:
             )
             return
 
-        # Fortschritt erkannt → Attempts resetten, weiter C6 senden
-        if (
-            self._last_temp_seen is not None
-            and abs(current - self._last_temp_seen) >= 0.25
-        ):
-            _LOGGER.warning(
-                "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) – weiter",
-                self._last_temp_seen,
-                current,
-                self._target_temp,
-            )
-            self._command_attempts = 0
-            self._last_temp_seen = current
+        # Nur Annäherung ans Ziel = Fortschritt (verhindert 30.5↔31.0-Pingpong)
+        if self._last_temp_seen is not None:
+            prev_err = abs(self._target_temp - self._last_temp_seen)
+            cur_err = abs(self._target_temp - current)
+            if cur_err < prev_err - 0.15:
+                _LOGGER.warning(
+                    "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f)",
+                    self._last_temp_seen,
+                    current,
+                    self._target_temp,
+                )
+                self._temp_no_progress = 0
+                self._command_attempts = 0
+                self._last_temp_seen = current
+            elif abs(current - self._last_temp_seen) >= 0.25:
+                # Wert hat sich geändert, aber weg vom Ziel → Richtung falsch
+                self._temp_no_progress += 1
+                _LOGGER.warning(
+                    "Temp-Rückschritt/Oszillation: %.1f → %.1f (Ziel %.1f) "
+                    "no_progress=%d",
+                    self._last_temp_seen,
+                    current,
+                    self._target_temp,
+                    self._temp_no_progress,
+                )
+                self._last_temp_seen = current
+            else:
+                self._temp_no_progress += 1
 
-        steps_left = abs(self._target_temp - current) / 0.5
-        max_attempts = max(MAX_COMMAND_ATTEMPTS, int(steps_left * 8) + 10)
-        if self._command_attempts >= max_attempts:
+        if self._temp_no_progress >= 6 or self._command_attempts >= MAX_COMMAND_ATTEMPTS:
             _LOGGER.error(
-                "Temperatur-Befehl abgebrochen nach %d Versuchen | "
-                "aktuell=%.1f Ziel=%.1f | sent=%d last_cc=%s",
-                self._command_attempts,
+                "Temperatur abgebrochen | aktuell=%.1f Ziel=%.1f start=%s "
+                "attempts=%d no_progress=%d sent=%d last_cc=%s",
                 current,
                 self._target_temp,
+                self._temp_start,
+                self._command_attempts,
+                self._temp_no_progress,
                 self._cc_sent,
                 self._last_cc_hex,
             )
             self._target_temp = NO_CHANGE_REQUESTED
+            async with self._pending_lock:
+                self._pending.clear()
             self._temp_done.set()
             return
 
@@ -829,6 +898,31 @@ class SpaClient:
         await self._send_temp_step(warmer)
         self._temp_check = CHECKS_BEFORE_RETRY
 
+    async def _send_light_step(self, color: bool = False) -> None:
+        """Licht-Schritt: gelernte Panel-Codes zuerst, dann CC/C6-Varianten."""
+        variants: list[tuple[int, int, int]] = []
+        if self._learned_light:
+            variants.extend(self._learned_light)
+        variants.extend(LIGHT_COLOR_VARIANTS if color else LIGHT_ON_VARIANTS)
+        # dedupe
+        seen: set[tuple[int, int, int]] = set()
+        uniq: list[tuple[int, int, int]] = []
+        for v in variants:
+            if v not in seen:
+                seen.add(v)
+                uniq.append(v)
+        mtype, btn, b6 = uniq[self._light_attempt % len(uniq)]
+        _LOGGER.warning(
+            "Licht-Schritt %s mtype=0x%02X btn=0x%02X b6=0x%02X attempt=%d",
+            "COLOR" if color else "ON/OFF",
+            mtype,
+            btn,
+            b6,
+            self._light_attempt + 1,
+        )
+        await self._queue_cc(btn, mtype, b6)
+        self._light_attempt += 1
+
     async def _handle_light_feedback(self, lights: dict) -> None:
         if self._light_check > 0:
             self._light_check -= 1
@@ -837,7 +931,7 @@ class SpaClient:
 
         if self._target_light_mode != LIGHT_NO_CHANGE:
             if lights["mode_raw"] == self._target_light_mode:
-                _LOGGER.info(
+                _LOGGER.warning(
                     "Licht-Modus erreicht: %s (raw=%s)",
                     lights.get("mode"),
                     lights["mode_raw"],
@@ -845,16 +939,10 @@ class SpaClient:
                 self._target_light_mode = LIGHT_NO_CHANGE
                 self._light_done.set()
             elif lights["brightness_raw"] == 0:
-                _LOGGER.info("Licht-Feedback: aus → sende BTN_LIGHT (241)")
-                await self._queue_cc(BTN_LIGHT)
+                await self._send_light_step(color=False)
                 self._light_check = CHECKS_BEFORE_RETRY
             else:
-                _LOGGER.info(
-                    "Licht-Feedback: mode_raw=%s Ziel=%s → sende BTN_LIGHT_COLOR (242)",
-                    lights["mode_raw"],
-                    self._target_light_mode,
-                )
-                await self._queue_cc(BTN_LIGHT_COLOR)
+                await self._send_light_step(color=True)
                 self._light_check = CHECKS_BEFORE_RETRY
             return
 
@@ -862,7 +950,7 @@ class SpaClient:
             return
 
         if lights["brightness_raw"] == self._target_light_brightness:
-            _LOGGER.info(
+            _LOGGER.warning(
                 "Licht-Helligkeit erreicht: %s (Ziel=%s)",
                 lights["brightness_raw"],
                 self._target_light_brightness,
@@ -871,13 +959,8 @@ class SpaClient:
             self._light_done.set()
             return
 
-        _LOGGER.info(
-            "Licht-Feedback: bright=%s Ziel=%s → sende BTN_LIGHT (241) | sent=%d",
-            lights["brightness_raw"],
-            self._target_light_brightness,
-            self._cc_sent,
-        )
-        await self._queue_cc(BTN_LIGHT)
+        # Ein/Aus: gleicher Button toggelt
+        await self._send_light_step(color=False)
         self._light_check = CHECKS_BEFORE_RETRY
 
     async def send_button(self, btn: int, mtype: int = CC_REQ, b6: int = 0) -> None:
@@ -1021,10 +1104,14 @@ class SpaClient:
             self._temp_done.clear()
             self._temp_check = 0
             self._command_attempts = 0
+            self._temp_no_progress = 0
             self._last_temp_seen = snap["set_temp"]
+            self._temp_start = snap["set_temp"]
             self._target_temp = target
+            async with self._pending_lock:
+                self._pending.clear()
             steps = abs(target - snap["set_temp"]) / 0.5
-            timeout = max(120.0, steps * 8.0 + 30.0)
+            timeout = max(90.0, steps * 6.0 + 20.0)
             await self._handle_temp_feedback(snap)
 
             try:
@@ -1068,6 +1155,7 @@ class SpaClient:
             self._debug_cmd = True
             self._cc_queued = 0
             self._cc_sent = 0
+            self._light_attempt = 0
             self._light_done.clear()
             self._light_check = 0
             self._target_light_mode = LIGHT_NO_CHANGE
@@ -1148,20 +1236,56 @@ class SpaClient:
 # ── DataUpdateCoordinator ────────────────────────────────────────────────────
 
 class SpaCoordinator(DataUpdateCoordinator):
-    """Koordiniert Daten-Updates und hält den SpaClient am Leben."""
+    """Koordiniert Daten-Updates und heilt die Verbindung selbst."""
 
     def __init__(self, hass: HomeAssistant, client: SpaClient) -> None:
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(seconds=5),
+            update_interval=timedelta(seconds=10),  # weniger HA-Last
         )
         self.client = client
+        self._heal_failures = 0
 
     async def _async_update_data(self) -> dict:
+        # Selbstheilung: reconnect wenn tot oder keine Status-Pakete
+        need_reconnect = False
         if not self.client.is_connected:
-            raise UpdateFailed("Keine Verbindung zum Spa")
+            need_reconnect = True
+            reason = "nicht verbunden"
+        elif self.client._last_status_ts and (
+            time.monotonic() - self.client._last_status_ts > 25.0
+        ):
+            need_reconnect = True
+            reason = "kein Status seit >25s"
+        elif self.client.status is None:
+            need_reconnect = True
+            reason = "noch kein Status"
+
+        if need_reconnect:
+            self._heal_failures += 1
+            _LOGGER.warning(
+                "Selbstheilung (%d): %s – reconnect…",
+                self._heal_failures,
+                reason,
+            )
+            try:
+                await self.client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(min(2.0 * self._heal_failures, 15.0))
+            try:
+                await self.client.connect()
+                await self.client.wait_ready(timeout=12.0)
+                self._heal_failures = 0
+                _LOGGER.warning(
+                    "Selbstheilung OK – Kanal 0x%02X",
+                    self.client.assigned_channel or 0,
+                )
+            except Exception as exc:
+                raise UpdateFailed(f"Reconnect fehlgeschlagen: {exc}") from exc
+
         s = self.client.status
         l = self.client.lights
         if s is None:
