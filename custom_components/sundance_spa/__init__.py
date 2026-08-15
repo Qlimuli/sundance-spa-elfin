@@ -61,8 +61,8 @@ CLIENT_TYPE_PANEL  = 0x02
 CC_REQ_ALT         = 0x17
 
 DETECT_CHANNEL_CYCLES = 5
-CHECKS_BEFORE_RETRY   = 6   # Status-Pakete zwischen Temp-Schritten
-TEMP_STEP_MIN_S       = 2.0 # Mindestabstand – Status braucht Zeit zum Setzen
+CHECKS_BEFORE_RETRY   = 8   # Status-Pakete zwischen Temp-Schritten
+TEMP_STEP_MIN_S       = 2.5 # Mindestabstand – Status braucht Zeit zum Setzen
 NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
 MAX_COMMAND_ATTEMPTS  = 24  # harte Obergrenze (kein Bus-Spam)
@@ -179,15 +179,15 @@ BLOWER_CC_BTN = 53
 BLOWER_CC_B6  = 217
 BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
 
-# Cameo iTouch Temp 0xC6 auf Kanal 0x10.
-# NUR bestätigte Wärmer/Kühler-Paare aus Panel-Sniff (3× up, 3× down).
-# 0xFC/0x4F war KEIN Up – setzte Soll auf ~29°C zurück (Log 13:24)!
+# Cameo C6 Temp – Richtungen aus Log 13:37–13:38 verifiziert:
+#   52 E7 = UP,  F0 47 = UP,  49 FF = DOWN (nicht Up!)
+#   97 21 = DOWN (Panel-Sniff Kühler)
 TEMP_UP_C6: tuple[tuple[int, int], ...] = (
     (0x52, 0xE7),
-    (0x49, 0xFF),
     (0xF0, 0x47),
 )
 TEMP_DOWN_C6: tuple[tuple[int, int], ...] = (
+    (0x49, 0xFF),
     (0x97, 0x21),
     (0xEC, 0x59),
     (0xC8, 0x7C),
@@ -373,6 +373,10 @@ class SpaClient:
         self._temp_start: float | None = None
         self._temp_no_progress = 0
         self._last_temp_cmd_ts = 0.0
+        self._temp_up_idx: int | None = None
+        self._temp_down_idx: int | None = None
+        self._last_temp_idx: int | None = None
+        self._last_temp_warmer: bool = True
         self._last_rx_ts = 0.0
         self._last_status_ts = 0.0
         self._learned_light: list[tuple[int, int, int]] = []  # (mtype, btn, b6)
@@ -785,11 +789,17 @@ class SpaClient:
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Ein 0,5°-Schritt per Cameo-C6 auf Kanal 0x10, rotierende Sniff-Payloads."""
+        """Ein 0,5°-Schritt. Nutzt nur verifizierte C6-Codes; nach Erfolg denselben Code behalten."""
         label = "TEMP_UP" if warmer else "TEMP_DOWN"
         pairs = TEMP_UP_C6 if warmer else TEMP_DOWN_C6
-        btn, b6 = pairs[self._command_attempts % len(pairs)]
-        # Immer Panel-Kanal 0x10 (C6 auf 0x11 wird ignoriert)
+        # Bei bekanntem funktionierendem Index diesen halten, sonst rotieren
+        if warmer and self._temp_up_idx is not None:
+            idx = self._temp_up_idx % len(pairs)
+        elif (not warmer) and self._temp_down_idx is not None:
+            idx = self._temp_down_idx % len(pairs)
+        else:
+            idx = self._command_attempts % len(pairs)
+        btn, b6 = pairs[idx]
         self._assigned_channel = CMD_CHANNEL
         now = time.monotonic()
         wait = TEMP_STEP_MIN_S - (now - self._last_temp_cmd_ts)
@@ -798,18 +808,16 @@ class SpaClient:
         await self._wait_pending_clear(timeout=2.0)
         _LOGGER.warning(
             "Temp-Schritt %s C6[%d] btn=0x%02X b6=0x%02X attempt=%d ch=0x10",
-            label,
-            self._command_attempts % len(pairs),
-            btn,
-            b6,
-            self._command_attempts + 1,
+            label, idx, btn, b6, self._command_attempts + 1,
         )
+        self._last_temp_idx = idx
+        self._last_temp_warmer = warmer
         await self._queue_cc(btn, C6_REQ, b6)
         self._last_temp_cmd_ts = time.monotonic()
         self._command_attempts += 1
 
     async def _handle_temp_feedback(self, status: dict) -> None:
-        """Feedback: nur Fortschritt ZUM Ziel zählt; sonst Abort gegen Oszillation."""
+        """Feedback: bei Fortschritt Code merken; bei Rückschritt anderen Code."""
         if self._temp_check > 0:
             self._temp_check -= 1
         if self._temp_check > 0 or self._target_temp == NO_CHANGE_REQUESTED:
@@ -824,51 +832,54 @@ class SpaClient:
             self._temp_done.set()
             _LOGGER.warning(
                 "Soll-Temperatur erreicht: %.1f °C | sent=%d",
-                current,
-                self._cc_sent,
+                current, self._cc_sent,
             )
             return
 
-        # Nur Annäherung ans Ziel = Fortschritt
         if self._last_temp_seen is not None:
             prev_err = abs(self._target_temp - self._last_temp_seen)
             cur_err = abs(self._target_temp - current)
+            delta = current - self._last_temp_seen
             if cur_err < prev_err - 0.15:
                 _LOGGER.warning(
-                    "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f)",
-                    self._last_temp_seen,
-                    current,
-                    self._target_temp,
+                    "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code_idx=%s",
+                    self._last_temp_seen, current, self._target_temp,
+                    self._last_temp_idx,
                 )
                 self._temp_no_progress = 0
-                # Attempts NICHT auf 0 – nächstes C6-Paar in der Rotation nutzen
+                # Erfolgreichen Code-Index merken
+                if self._last_temp_warmer:
+                    self._temp_up_idx = self._last_temp_idx
+                else:
+                    self._temp_down_idx = self._last_temp_idx
                 self._last_temp_seen = current
-            elif abs(current - self._last_temp_seen) >= 0.25:
+            elif abs(delta) >= 0.25:
                 self._temp_no_progress += 1
                 _LOGGER.warning(
-                    "Temp-Rückschritt: %.1f → %.1f (Ziel %.1f) no_progress=%d",
-                    self._last_temp_seen,
-                    current,
-                    self._target_temp,
-                    self._temp_no_progress,
+                    "Temp-Rückschritt: %.1f → %.1f (Ziel %.1f) idx=%s – wechsle Code",
+                    self._last_temp_seen, current, self._target_temp,
+                    self._last_temp_idx,
                 )
+                # Falschen Code verwerfen, nächsten nehmen
+                if self._last_temp_warmer:
+                    pairs = TEMP_UP_C6
+                    self._temp_up_idx = ((self._last_temp_idx or 0) + 1) % len(pairs)
+                else:
+                    pairs = TEMP_DOWN_C6
+                    self._temp_down_idx = ((self._last_temp_idx or 0) + 1) % len(pairs)
                 self._last_temp_seen = current
             else:
                 self._temp_no_progress += 1
 
-        # Mehr Versuche: jedes C6-Paar mehrmals, große Sprünge brauchen Zeit
-        max_att = max(MAX_COMMAND_ATTEMPTS, int(abs(self._target_temp - (self._temp_start or current)) / 0.5) * 5 + 10)
-        if self._temp_no_progress >= 10 or self._command_attempts >= max_att:
+        steps_needed = abs(self._target_temp - (self._temp_start or current)) / 0.5
+        max_att = max(MAX_COMMAND_ATTEMPTS, int(steps_needed) * 4 + 12)
+        if self._temp_no_progress >= 12 or self._command_attempts >= max_att:
             _LOGGER.error(
                 "Temperatur abgebrochen | aktuell=%.1f Ziel=%.1f start=%s "
                 "attempts=%d no_progress=%d sent=%d last_cc=%s",
-                current,
-                self._target_temp,
-                self._temp_start,
-                self._command_attempts,
-                self._temp_no_progress,
-                self._cc_sent,
-                self._last_cc_hex,
+                current, self._target_temp, self._temp_start,
+                self._command_attempts, self._temp_no_progress,
+                self._cc_sent, self._last_cc_hex,
             )
             self._target_temp = NO_CHANGE_REQUESTED
             async with self._pending_lock:
@@ -1087,6 +1098,9 @@ class SpaClient:
             self._temp_check = 0
             self._command_attempts = 0
             self._temp_no_progress = 0
+            self._temp_up_idx = None
+            self._temp_down_idx = None
+            self._last_temp_idx = None
             self._last_temp_seen = snap["set_temp"]
             self._temp_start = snap["set_temp"]
             self._target_temp = target
