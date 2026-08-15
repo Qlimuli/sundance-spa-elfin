@@ -526,7 +526,8 @@ class SpaClient:
                             if channel == self._assigned_channel
                             else "PANEL"
                         )
-                        _LOGGER.info(
+                        # WARNING: HA-Default-Logger zeigt INFO oft nicht
+                        _LOGGER.warning(
                             "CC-TASTE %s | ch=0x%02X mtype=0x%02X "
                             "btn=%d b6=%d dec=%d raw=%s",
                             src,
@@ -538,7 +539,7 @@ class SpaClient:
                             msg.hex(" "),
                         )
 
-            # Unbekannte Message-Typen loggen (Touch-Panel kann anderes nutzen)
+            # Unbekannte Message-Typen (Touch-Panel kann anderes nutzen)
             elif (
                 self._sniff_panel_cc
                 and mtype
@@ -557,7 +558,7 @@ class SpaClient:
                 )
                 and len(msg) >= 5
             ):
-                _LOGGER.info(
+                _LOGGER.warning(
                     "BUS-MSG unbekannt | ch=0x%02X mid=0x%02X mtype=0x%02X len=%d raw=%s",
                     channel,
                     msg[3] if len(msg) > 3 else 0,
