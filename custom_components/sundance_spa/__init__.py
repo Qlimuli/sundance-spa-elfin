@@ -79,16 +79,14 @@ BTN_PUMP2          = 229
 BTN_CLEARRAY       = 239
 BTN_LIGHT          = 241
 BTN_LIGHT_COLOR    = 242
-# Cameo: Licht oft über CC 241/242; Panel kann C6 nutzen – Sniff lernt nach
+# Nur CC-Lichtcodes – KEINE C6 (C6-Replays haben Solltemp auf ~40°C getrieben)
 LIGHT_ON_VARIANTS: tuple[tuple[int, int, int], ...] = (
     (CC_REQ, 241, 0),
     (CC_REQ, 0xF1, 0x00),
-    (C6_REQ, 0xF1, 0x00),
 )
 LIGHT_COLOR_VARIANTS: tuple[tuple[int, int, int], ...] = (
     (CC_REQ, 242, 0),
     (CC_REQ, 0xF2, 0x00),
-    (C6_REQ, 0xF2, 0x00),
 )
 BTN_ZIRK           = 242
 BTN_BLOWER         = 237   # Klartext NICHT verwenden – steuert Pumpen; siehe BLOWER_CC_*
@@ -556,9 +554,11 @@ class SpaClient:
                         if src == "PANEL":
                             if channel not in self._active_channels:
                                 self._active_channels.append(channel)
-                            entry = (mtype, btn_b5, b6)
-                            if entry not in self._learned_light:
-                                self._learned_light.append(entry)
+                            # Nur echte Licht-CC merken (241/242), keine Temp-CCs
+                            if decoded in (241, 242, BTN_LIGHT, BTN_LIGHT_COLOR):
+                                entry = (mtype, btn_b5, b6)
+                                if entry not in self._learned_light:
+                                    self._learned_light.append(entry)
                         _LOGGER.warning(
                             "CC-TASTE %s | ch=0x%02X mtype=0x%02X "
                             "btn=%d b6=%d dec=%d raw=%s",
@@ -593,30 +593,16 @@ class SpaClient:
                 if mtype == C6_REQ and len(msg) >= 7:
                     if channel not in self._active_channels:
                         self._active_channels.append(channel)
-                    # Kanalwechsel wenn wir denselben wie das Panel haben
-                    if (
-                        self._assigned_channel is not None
-                        and channel == self._assigned_channel
-                    ):
-                        _LOGGER.warning(
-                            "Panel-C6 auf unserem Kanal 0x%02X – wechsle Kanal",
+                    # Nur loggen – NIEMALS C6 als Licht/Temp-Befehl speichern
+                    # (C6-Replays haben Solltemp auf ~40°C getrieben)
+                    if self._debug_cmd:
+                        _LOGGER.info(
+                            "C6-PANEL | ch=0x%02X btn=0x%02X b6=0x%02X raw=%s",
                             channel,
+                            msg[5],
+                            msg[6],
+                            msg.hex(" "),
                         )
-                        self._assigned_channel = None
-                        self._pick_idle_channel()
-                    btn, b6 = msg[5], msg[6]
-                    entry = (C6_REQ, btn, b6)
-                    if entry not in self._learned_light:
-                        self._learned_light.append(entry)
-                        if len(self._learned_light) > 20:
-                            self._learned_light.pop(0)
-                    _LOGGER.warning(
-                        "C6-PANEL | ch=0x%02X btn=0x%02X b6=0x%02X raw=%s",
-                        channel,
-                        btn,
-                        b6,
-                        msg.hex(" "),
-                    )
                 elif self._debug_cmd:
                     _LOGGER.debug(
                         "BUS-MSG unbekannt | ch=0x%02X mtype=0x%02X raw=%s",
@@ -678,33 +664,31 @@ class SpaClient:
                     await self._handle_light_feedback(dec)
 
     def _pick_idle_channel(self) -> None:
-        """Wählt CTS-Kanal, der nicht vom iTouch-Panel genutzt wird (0x10 meiden)."""
-        avoid = set(self._active_channels) | {0x10}  # 0x10 = typisch Cameo-Panel
+        """Wählt CTS-Kanal. 0x10 ist OK wenn kein anderer existiert (Cameo oft nur 0x10)."""
+        avoid = set(self._active_channels)
         candidates = sorted(
             ch for ch in self._discovered_channels if ch not in avoid
         )
         if not candidates:
-            # Fallback: irgendein discovered außer active
-            candidates = sorted(
-                ch for ch in self._discovered_channels
-                if ch not in self._active_channels
-            )
+            candidates = sorted(self._discovered_channels)
         if candidates:
-            ch = candidates[0]
+            # Bevorzuge nicht-0x10, aber nimm 0x10 wenn es der einzige ist
+            preferred = [c for c in candidates if c != 0x10] or candidates
+            ch = preferred[0]
             self._assigned_channel = ch
             self._channel_ready.set()
             _LOGGER.info(
-                "Channel assigned: 0x%02X (idle, avoid=%s discovered=%s)",
+                "Channel assigned: 0x%02X (discovered=%s active=%s)",
                 ch,
-                [f"0x{c:02X}" for c in sorted(avoid)],
                 [f"0x{c:02X}" for c in self._discovered_channels],
+                [f"0x{c:02X}" for c in self._active_channels],
             )
             return
-        _LOGGER.warning(
-            "Kein freier Kanal (discovered=%s, active=%s) – warte weiter",
-            [f"0x{c:02X}" for c in self._discovered_channels],
-            [f"0x{c:02X}" for c in self._active_channels],
-        )
+        # Letzter Fallback – still und ohne Spam
+        if self._assigned_channel is None:
+            self._assigned_channel = CMD_CHANNEL
+            self._channel_ready.set()
+            _LOGGER.info("Channel Fallback: 0x%02X", CMD_CHANNEL)
 
     async def _flush_pending(self, channel: int) -> None:
         """Sendet genau ein wartendes CC-Paket auf dem CTS-Kanal (Halbduplex)."""
@@ -899,19 +883,21 @@ class SpaClient:
         self._temp_check = CHECKS_BEFORE_RETRY
 
     async def _send_light_step(self, color: bool = False) -> None:
-        """Licht-Schritt: gelernte Panel-Codes zuerst, dann CC/C6-Varianten."""
-        variants: list[tuple[int, int, int]] = []
-        if self._learned_light:
-            variants.extend(self._learned_light)
-        variants.extend(LIGHT_COLOR_VARIANTS if color else LIGHT_ON_VARIANTS)
-        # dedupe
-        seen: set[tuple[int, int, int]] = set()
-        uniq: list[tuple[int, int, int]] = []
-        for v in variants:
-            if v not in seen:
-                seen.add(v)
-                uniq.append(v)
-        mtype, btn, b6 = uniq[self._light_attempt % len(uniq)]
+        """Licht-Schritt: nur CC 241/242 (+ gelernte echte Licht-CCs). Nie C6."""
+        variants: list[tuple[int, int, int]] = list(
+            LIGHT_COLOR_VARIANTS if color else LIGHT_ON_VARIANTS
+        )
+        for v in self._learned_light:
+            if v[0] == CC_REQ and v not in variants:
+                variants.append(v)
+        mtype, btn, b6 = variants[self._light_attempt % len(variants)]
+        # Hartes Limit – kein Dauerfeuer
+        if self._light_attempt >= 8:
+            _LOGGER.error("Licht-Versuche erschöpft – Abbruch")
+            self._target_light_brightness = LIGHT_NO_CHANGE
+            self._target_light_mode = LIGHT_NO_CHANGE
+            self._light_done.set()
+            return
         _LOGGER.warning(
             "Licht-Schritt %s mtype=0x%02X btn=0x%02X b6=0x%02X attempt=%d",
             "COLOR" if color else "ON/OFF",
