@@ -48,6 +48,7 @@ LIGHTS_UPDATE     = 0xCA
 STATUS_UPDATE_ALT = 0x16
 LIGHTS_UPDATE_ALT = 0x23
 CC_REQ            = 0xCC
+C6_REQ            = 0xC6  # Cameo iTouch Temp/UI (Panel-Sniff 2026-08-15)
 CMD_CHANNEL       = 0x10
 CH_BROADCAST      = 0xFE
 MSG_CHANNEL_REQ    = 0x01
@@ -168,16 +169,27 @@ BLOWER_CC_BTN = 53
 BLOWER_CC_B6  = 217
 BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
 
-# Temperatur: HyperActiveJ sendet Klartext 225/226 mit b6=0 auf dem zugewiesenen
-# Kanal. Cameo-Panel-Sniffs nutzen XOR-Paare – wir versuchen beides.
+# Cameo iTouch: Temperatur läuft über Message-Typ 0xC6 (nicht 0xCC).
+# Payload-Paare aus Panel-Sniff 2026-08-15 (3× Wärmer, dann 3× Kühler).
+TEMP_UP_C6: tuple[tuple[int, int], ...] = (
+    (0x52, 0xE7),
+    (0x49, 0xFF),
+    (0xF0, 0x47),
+)
+TEMP_DOWN_C6: tuple[tuple[int, int], ...] = (
+    (0x97, 0x21),
+    (0xEC, 0x59),
+    (0xC8, 0x7C),
+)
+# Fallback 0xCC (780/HyperActiveJ) – falls C6 nicht greift
 TEMP_UP_VARIANTS: tuple[tuple[int, int], ...] = (
-    (BTN_TEMP_UP, 0),    # Klartext – funktioniert auf Sundance 780 / Referenz
-    (18, 242),           # Panel-Paar: 18^242^1 = 225
-    (19, 243),           # Hunt-Alternative
+    (BTN_TEMP_UP, 0),
+    (18, 242),
+    (19, 243),
 )
 TEMP_DOWN_VARIANTS: tuple[tuple[int, int], ...] = (
-    (BTN_TEMP_DOWN, 0),  # Klartext
-    (0, 227),            # Panel-Paar: 0^227^1 = 226
+    (BTN_TEMP_DOWN, 0),
+    (0, 227),
 )
 # Panel-Sniff: Range High = 141/69 (decoded 201)
 TEMP_RANGE_HI_CC_BTN = 141
@@ -558,14 +570,24 @@ class SpaClient:
                 )
                 and len(msg) >= 5
             ):
-                _LOGGER.warning(
-                    "BUS-MSG unbekannt | ch=0x%02X mid=0x%02X mtype=0x%02X len=%d raw=%s",
-                    channel,
-                    msg[3] if len(msg) > 3 else 0,
-                    mtype,
-                    len(msg),
-                    msg.hex(" "),
-                )
+                if mtype == C6_REQ and len(msg) >= 7:
+                    _LOGGER.warning(
+                        "C6-PANEL | ch=0x%02X btn=0x%02X b6=0x%02X raw=%s",
+                        channel,
+                        msg[5],
+                        msg[6],
+                        msg.hex(" "),
+                    )
+                else:
+                    _LOGGER.warning(
+                        "BUS-MSG unbekannt | ch=0x%02X mid=0x%02X mtype=0x%02X "
+                        "len=%d raw=%s",
+                        channel,
+                        msg[3] if len(msg) > 3 else 0,
+                        mtype,
+                        len(msg),
+                        msg.hex(" "),
+                    )
 
             # ── Status / Lights ─────────────────────────────────────────────
             if mtype in (STATUS_UPDATE, STATUS_UPDATE_ALT):
@@ -729,25 +751,33 @@ class SpaClient:
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Ein TEMP_UP/DOWN – Encoding rotiert (Klartext zuerst, wie Referenz)."""
-        variants = TEMP_UP_VARIANTS if warmer else TEMP_DOWN_VARIANTS
-        btn, b6 = variants[self._command_attempts % len(variants)]
+        """Ein Temp-Schritt: Cameo nutzt 0xC6 (Panel-Sniff), Fallback 0xCC."""
         label = "TEMP_UP" if warmer else "TEMP_DOWN"
-        _LOGGER.info(
-            "Temp-Schritt %s encoding=%d/%d btn=%d b6=%d dec=%d attempt=%d "
-            "kanal=0x%02X cts_own=%d sent=%d",
+        # Phase 1: echte C6-Payloads vom iTouch-Panel
+        c6 = TEMP_UP_C6 if warmer else TEMP_DOWN_C6
+        if self._command_attempts < len(c6) * 4:
+            btn, b6 = c6[self._command_attempts % len(c6)]
+            mtype = C6_REQ
+            phase = "C6"
+        else:
+            variants = TEMP_UP_VARIANTS if warmer else TEMP_DOWN_VARIANTS
+            btn, b6 = variants[self._command_attempts % len(variants)]
+            mtype = CC_REQ
+            phase = "CC-fallback"
+        _LOGGER.warning(
+            "Temp-Schritt %s phase=%s btn=0x%02X b6=0x%02X mtype=0x%02X "
+            "attempt=%d kanal=0x%02X cts_own=%d sent=%d",
             label,
-            (self._command_attempts % len(variants)) + 1,
-            len(variants),
+            phase,
             btn,
             b6,
-            btn ^ b6 ^ 1,
+            mtype,
             self._command_attempts + 1,
             self._assigned_channel or 0,
             self._cts_own,
             self._cc_sent,
         )
-        await self._queue_cc(btn, CC_REQ, b6)
+        await self._queue_cc(btn, mtype, b6)
         self._command_attempts += 1
 
     async def _handle_temp_feedback(self, status: dict) -> None:
