@@ -61,8 +61,8 @@ CLIENT_TYPE_PANEL  = 0x02
 CC_REQ_ALT         = 0x17
 
 DETECT_CHANNEL_CYCLES = 5
-CHECKS_BEFORE_RETRY   = 10   # Status-Pakete zwischen Temp-Schritten
-TEMP_STEP_MIN_S       = 3.0 # Mindestabstand – Status braucht Zeit zum Setzen
+CHECKS_BEFORE_RETRY   = 8   # Status-Pakete zwischen Temp-Schritten
+TEMP_STEP_MIN_S       = 2.8 # Mindestabstand – Status braucht Zeit zum Setzen
 NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
 MAX_COMMAND_ATTEMPTS  = 80  # harte Obergrenze (kein Bus-Spam)
@@ -183,14 +183,17 @@ BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
 #   EC 59, C8 7C  →  DOWN (31→30.5→30.0)
 #   52 E7, 49 FF  →  UP   (30→30.5→31.0)  – NIEMALS bei DOWN senden!
 # Format: (mtype, btn, b6)
-# Nur Codes die in Live-Logs *konsistent* die richtige Richtung bewirken.
-# 52 E7 / B2 00 / 49 FF erzeugen oft GEGEN – nicht in UP.
+# Sichere Codes + Variation gegen Debounce identischer Frames
+# UP: F0 47 = C6-Replay (Log-bewährt); 225/0 = CC Klartext TEMP_UP (HyperActiveJ)
 TEMP_UP_CODES: list[tuple[int, int, int]] = [
-    (0xC6, 0xF0, 0x47),  # Log: zuverlässig UP (teils +2.5 Sprung)
+    (0xC6, 0xF0, 0x47),
+    (0xCC, 225, 0),
+    (0xC6, 0xF0, 0x47),
 ]
 TEMP_DOWN_CODES: list[tuple[int, int, int]] = [
-    (0xC6, 0xEC, 0x59),  # Log: DOWN
-    (0xC6, 0xC8, 0x7C),  # Log: DOWN
+    (0xC6, 0xEC, 0x59),
+    (0xC6, 0xC8, 0x7C),
+    (0xCC, 226, 0),
 ]
 MSG_SET_TEMP = 0x20
 TEMP_UP_C6 = tuple((b, x) for m, b, x in TEMP_UP_CODES if m == 0xC6)
@@ -848,12 +851,11 @@ class SpaClient:
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Nur sichere Codes; Blacklist filtert GEGEN-Codes dauerhaft."""
+        """Temp-Frame auf dem *zugewiesenen* Kanal (kein Zwang auf 0x10)."""
         codes = list(TEMP_UP_CODES if warmer else TEMP_DOWN_CODES)
         bl = self._temp_blacklist_up if warmer else self._temp_blacklist_down
         filtered = [c for c in codes if c not in bl]
         if not filtered:
-            # Blacklist leeren nur wenn sonst nichts übrig
             bl.clear()
             filtered = list(codes)
         codes = filtered
@@ -861,7 +863,13 @@ class SpaClient:
         idx = int(getattr(self, "_temp_code_idx", 0)) % len(codes)
         mtype, btn, b6 = codes[idx]
         label = "TEMP_UP" if warmer else "TEMP_DOWN"
-        self._assigned_channel = CMD_CHANNEL
+
+        # Nur Fallback wenn kein Kanal – nie hart überschreiben
+        ch = self._assigned_channel
+        if ch is None:
+            ch = CMD_CHANNEL
+            self._assigned_channel = ch
+            _LOGGER.warning("Temp-Schritt: kein Kanal → Fallback 0x%02X", ch)
 
         now = time.monotonic()
         wait = TEMP_STEP_MIN_S - (now - self._last_temp_cmd_ts)
@@ -870,12 +878,14 @@ class SpaClient:
         await self._wait_pending_clear(timeout=3.0)
 
         _LOGGER.warning(
-            "Temp-Schritt %s idx=%d/%d btn=0x%02X b6=0x%02X "
-            "attempt=%d steps_ok=%d bl=%d",
-            label, idx, len(codes), btn, b6,
+            "Temp-Schritt %s idx=%d/%d mtype=0x%02X btn=0x%02X b6=0x%02X "
+            "attempt=%d steps_ok=%d ch=0x%02X disc=%s active=%s",
+            label, idx, len(codes), mtype, btn, b6,
             self._command_attempts + 1,
             getattr(self, "_temp_steps_done", 0),
-            len(bl),
+            ch,
+            [f"0x{c:02X}" for c in self._discovered_channels],
+            [f"0x{c:02X}" for c in self._active_channels],
         )
         self._last_temp_idx = idx
         self._last_temp_code = (mtype, btn, b6)
@@ -883,10 +893,12 @@ class SpaClient:
         await self._queue_cc(btn, mtype, b6)
         self._last_temp_cmd_ts = time.monotonic()
         self._command_attempts += 1
+        # Nach jedem Send nächsten Code für Variation (Debounce)
+        self._temp_code_idx = (idx + 1) % len(codes)
 
 
     async def _handle_temp_feedback(self, status: dict) -> None:
-        """F0=UP, EC/C8=DOWN; GEGEN → dauerhafte Blacklist; bei Stall Direct-Set."""
+        """Status auswerten; GEGEN → Blacklist; Fortschritt → weiter mit Variation."""
         if self._temp_check > 0:
             self._temp_check -= 1
         if self._temp_check > 0 or self._target_temp == NO_CHANGE_REQUESTED:
@@ -912,63 +924,56 @@ class SpaClient:
         moved = abs(delta) >= 0.25
         code = getattr(self, "_last_temp_code", None)
         warmer_needed = self._target_temp > current
-        codes = TEMP_UP_CODES if warmer_needed else TEMP_DOWN_CODES
         bl = self._temp_blacklist_up if warmer_needed else self._temp_blacklist_down
+
+        # Status-Debug (immer während Steuerung)
+        _LOGGER.warning(
+            "Temp-STATUS set=%.1f ziel=%.1f prev=%.1f display=%s in_menu=%s "
+            "code=%s ch=0x%02X",
+            current, self._target_temp, prev,
+            status.get("display"), status.get("in_menu"),
+            code, self._assigned_channel or 0,
+        )
 
         if moved and err_now < err_prev - 0.15:
             self._temp_steps_done = getattr(self, "_temp_steps_done", 0) + 1
             self._temp_fail_on_code = 0
             self._temp_stall_rounds = 0
-            # Bei Erfolg denselben guten Code behalten (F0 oft mehrfach)
             _LOGGER.warning(
                 "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code=%s steps_ok=%d",
                 prev, current, self._target_temp, code, self._temp_steps_done,
             )
             self._last_temp_seen = current
             self._temp_no_progress = 0
-            self._temp_check = max(CHECKS_BEFORE_RETRY, 10)
+            self._temp_check = max(CHECKS_BEFORE_RETRY, 8)
             await self._send_temp_step(self._target_temp > current)
             return
 
         if moved and err_now > err_prev + 0.15:
             _LOGGER.warning(
-                "Temp GEGEN Ziel: %.1f → %.1f code=%s – BLACKLIST dauerhaft",
+                "Temp GEGEN Ziel: %.1f → %.1f code=%s – BLACKLIST",
                 prev, current, code,
             )
             if code is not None:
                 bl.add(code)
-            self._temp_code_idx = (getattr(self, "_temp_code_idx", 0) + 1) % max(len(codes), 1)
             self._temp_fail_on_code = 0
             self._last_temp_seen = current
             self._temp_no_progress += 1
         else:
             self._temp_fail_on_code = getattr(self, "_temp_fail_on_code", 0) + 1
             self._temp_no_progress += 1
-            if self._temp_fail_on_code >= 5:
-                self._temp_code_idx = (getattr(self, "_temp_code_idx", 0) + 1) % max(len(codes), 1)
+            if self._temp_fail_on_code >= 4:
                 self._temp_stall_rounds = getattr(self, "_temp_stall_rounds", 0) + 1
                 self._temp_fail_on_code = 0
-                _LOGGER.warning(
-                    "Temp wirkungslos → idx=%d stall=%d",
-                    self._temp_code_idx, self._temp_stall_rounds,
-                )
-                # Nach Stall: Direct-Set 0x20 versuchen
-                if self._temp_stall_rounds >= 2:
+                _LOGGER.warning("Temp wirkungslos stall=%d", self._temp_stall_rounds)
+                if self._temp_stall_rounds >= 3:
                     await self._try_direct_set(self._target_temp)
                     self._temp_stall_rounds = 0
-            elif self._temp_no_progress <= 2 or self._temp_no_progress % 8 == 0:
-                _LOGGER.warning(
-                    "Temp no_change set=%.1f ziel=%.1f fail=%d steps_ok=%d",
-                    current, self._target_temp, self._temp_fail_on_code,
-                    getattr(self, "_temp_steps_done", 0),
-                )
 
-        steps_left = abs(self._target_temp - current) / 0.5
-        max_att = max(80, int(steps_left) * 20 + 30)
+        max_att = max(100, int(abs(self._target_temp - current) / 0.5) * 20 + 40)
         if self._command_attempts >= max_att:
             _LOGGER.error(
-                "Temperatur abgebrochen | aktuell=%.1f Ziel=%.1f "
-                "attempts=%d steps_ok=%d",
+                "Temperatur abgebrochen | aktuell=%.1f Ziel=%.1f attempts=%d steps_ok=%d",
                 current, self._target_temp, self._command_attempts,
                 getattr(self, "_temp_steps_done", 0),
             )
@@ -980,6 +985,7 @@ class SpaClient:
 
         await self._send_temp_step(self._target_temp > current)
         self._temp_check = CHECKS_BEFORE_RETRY
+
 
     async def _try_direct_set(self, target: float) -> None:
         """MSG 0x20 Direct-Set – Fallback wenn Button-Codes stagnieren."""
@@ -1214,14 +1220,14 @@ class SpaClient:
             self._temp_fail_on_code = 0
             self._temp_stall_rounds = 0
             # Bekannt schlechte UP-Codes von vornherein sperren
+            # Nur Codes die Live als GEGEN-Richtung erwiesen sind
             self._temp_blacklist_up = {
                 (0xC6, 0x52, 0xE7),
                 (0xC6, 0xB2, 0x00),
-                (0xC6, 0x49, 0xFF),
             }
             self._temp_blacklist_down = {
-                (0xC6, 0x52, 0xE7),
                 (0xC6, 0xF0, 0x47),
+                (0xC6, 0x52, 0xE7),
                 (0xC6, 0xB2, 0x00),
             }
             self._last_temp_code = None
