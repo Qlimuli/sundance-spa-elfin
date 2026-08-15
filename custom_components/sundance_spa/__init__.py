@@ -179,10 +179,21 @@ BLOWER_CC_BTN = 53
 BLOWER_CC_B6  = 217
 BLOWER_CC_ALT: tuple[tuple[int, int], ...] = ((204, 32),)
 
-# Cameo iTouch: Temperatur über 0xC6 (Panel-Sniff 2026-08-15).
-# Nur JEWEILS ein stabiles Paar – Rotation mischte Up/Down und oszillierte.
-TEMP_UP_C6_BTN, TEMP_UP_C6_B6 = 0x52, 0xE7
-TEMP_DOWN_C6_BTN, TEMP_DOWN_C6_B6 = 0x97, 0x21
+# Cameo iTouch: Temp über 0xC6 auf Kanal 0x10. Mehrere Sniff-Paare rotieren.
+TEMP_UP_C6: tuple[tuple[int, int], ...] = (
+    (0x52, 0xE7),
+    (0x49, 0xFF),
+    (0xF0, 0x47),
+    (0xB2, 0x00),
+    (0xFC, 0x4F),
+)
+TEMP_DOWN_C6: tuple[tuple[int, int], ...] = (
+    (0x97, 0x21),
+    (0xEC, 0x59),
+    (0xC8, 0x7C),
+    (0xE2, 0x56),
+    (0xCF, 0x7C),
+)
 # Fallback 0xCC (780/HyperActiveJ) – falls C6 nicht greift
 TEMP_UP_VARIANTS: tuple[tuple[int, int], ...] = (
     (BTN_TEMP_UP, 0),
@@ -395,15 +406,12 @@ class SpaClient:
         try:
             await asyncio.wait_for(self._channel_ready.wait(), timeout=15.0)
         except asyncio.TimeoutError:
-            # Nicht 0x10 erzwingen – das ist oft das iTouch-Panel (Bus-Konkurrenz)
-            self._pick_idle_channel()
-            if self._assigned_channel is None:
-                # Nächster freier Kanal ab 0x11
-                self._assigned_channel = 0x11
-                self._channel_ready.set()
-                _LOGGER.warning(
-                    "Kein CTS-Kanal entdeckt – nutze 0x11 (vermeide Panel 0x10)"
-                )
+            self._assigned_channel = CMD_CHANNEL  # Cameo: Panel + wir auf 0x10
+            self._channel_ready.set()
+            _LOGGER.warning("Channel-Timeout – Fallback 0x%02X", CMD_CHANNEL)
+        # Cameo iTouch: C6/Befehle nur auf 0x10 wirksam – Kanal erzwingen
+        self._assigned_channel = CMD_CHANNEL
+        self._channel_ready.set()
         self._last_rx_ts = time.monotonic()
         _LOGGER.info(
             "Spa verbunden: %s:%s – Channel assigned: 0x%02X",
@@ -591,18 +599,14 @@ class SpaClient:
                 and len(msg) >= 5
             ):
                 if mtype == C6_REQ and len(msg) >= 7:
-                    if channel not in self._active_channels:
-                        self._active_channels.append(channel)
-                    # Nur loggen – NIEMALS C6 als Licht/Temp-Befehl speichern
-                    # (C6-Replays haben Solltemp auf ~40°C getrieben)
-                    if self._debug_cmd:
-                        _LOGGER.info(
-                            "C6-PANEL | ch=0x%02X btn=0x%02X b6=0x%02X raw=%s",
-                            channel,
-                            msg[5],
-                            msg[6],
-                            msg.hex(" "),
-                        )
+                    # Immer loggen (Sniff für Licht/Temp) – nie auto-replayen
+                    _LOGGER.warning(
+                        "C6-PANEL | ch=0x%02X btn=0x%02X b6=0x%02X raw=%s",
+                        channel,
+                        msg[5],
+                        msg[6],
+                        msg.hex(" "),
+                    )
                 elif self._debug_cmd:
                     _LOGGER.debug(
                         "BUS-MSG unbekannt | ch=0x%02X mtype=0x%02X raw=%s",
@@ -783,25 +787,24 @@ class SpaClient:
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Ein 0,5°-Schritt per Cameo-C6 – nur ein festes Payload-Paar je Richtung."""
+        """Ein 0,5°-Schritt per Cameo-C6 auf Kanal 0x10, rotierende Sniff-Payloads."""
         label = "TEMP_UP" if warmer else "TEMP_DOWN"
-        if warmer:
-            btn, b6 = TEMP_UP_C6_BTN, TEMP_UP_C6_B6
-        else:
-            btn, b6 = TEMP_DOWN_C6_BTN, TEMP_DOWN_C6_B6
+        pairs = TEMP_UP_C6 if warmer else TEMP_DOWN_C6
+        btn, b6 = pairs[self._command_attempts % len(pairs)]
+        # Immer Panel-Kanal 0x10 (C6 auf 0x11 wird ignoriert)
+        self._assigned_channel = CMD_CHANNEL
         now = time.monotonic()
         wait = TEMP_STEP_MIN_S - (now - self._last_temp_cmd_ts)
         if wait > 0:
             await asyncio.sleep(wait)
-        # Pending leeren, bevor neuer Befehl → kein Stau, Panel atmet
         await self._wait_pending_clear(timeout=2.0)
-        _LOGGER.info(
-            "Temp-Schritt %s C6 btn=0x%02X b6=0x%02X attempt=%d sent=%d",
+        _LOGGER.warning(
+            "Temp-Schritt %s C6[%d] btn=0x%02X b6=0x%02X attempt=%d ch=0x10",
             label,
+            self._command_attempts % len(pairs),
             btn,
             b6,
             self._command_attempts + 1,
-            self._cc_sent,
         )
         await self._queue_cc(btn, C6_REQ, b6)
         self._last_temp_cmd_ts = time.monotonic()
@@ -828,7 +831,7 @@ class SpaClient:
             )
             return
 
-        # Nur Annäherung ans Ziel = Fortschritt (verhindert 30.5↔31.0-Pingpong)
+        # Nur Annäherung ans Ziel = Fortschritt
         if self._last_temp_seen is not None:
             prev_err = abs(self._target_temp - self._last_temp_seen)
             cur_err = abs(self._target_temp - current)
@@ -840,14 +843,12 @@ class SpaClient:
                     self._target_temp,
                 )
                 self._temp_no_progress = 0
-                self._command_attempts = 0
+                # Attempts NICHT auf 0 – nächstes C6-Paar in der Rotation nutzen
                 self._last_temp_seen = current
             elif abs(current - self._last_temp_seen) >= 0.25:
-                # Wert hat sich geändert, aber weg vom Ziel → Richtung falsch
                 self._temp_no_progress += 1
                 _LOGGER.warning(
-                    "Temp-Rückschritt/Oszillation: %.1f → %.1f (Ziel %.1f) "
-                    "no_progress=%d",
+                    "Temp-Rückschritt: %.1f → %.1f (Ziel %.1f) no_progress=%d",
                     self._last_temp_seen,
                     current,
                     self._target_temp,
@@ -857,7 +858,9 @@ class SpaClient:
             else:
                 self._temp_no_progress += 1
 
-        if self._temp_no_progress >= 6 or self._command_attempts >= MAX_COMMAND_ATTEMPTS:
+        # Mehr Versuche: jedes C6-Paar mehrmals, große Sprünge brauchen Zeit
+        max_att = max(MAX_COMMAND_ATTEMPTS, int(abs(self._target_temp - (self._temp_start or current)) / 0.5) * 5 + 10)
+        if self._temp_no_progress >= 10 or self._command_attempts >= max_att:
             _LOGGER.error(
                 "Temperatur abgebrochen | aktuell=%.1f Ziel=%.1f start=%s "
                 "attempts=%d no_progress=%d sent=%d last_cc=%s",
@@ -1006,13 +1009,9 @@ class SpaClient:
             return dict(self._lights) if self._lights else None
 
     async def _ensure_channel(self) -> int:
-        if self._assigned_channel is not None:
-            return self._assigned_channel
-        try:
-            await asyncio.wait_for(self._channel_ready.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            self._assigned_channel = CMD_CHANNEL
-        return self._assigned_channel or CMD_CHANNEL
+        # Cameo: immer 0x10 – C6/CC auf anderen Kanälen greifen nicht
+        self._assigned_channel = CMD_CHANNEL
+        return CMD_CHANNEL
 
     async def _ensure_temp_range(self, target: float, current_raw: int) -> None:
         """Cameo 880: Temperaturbereich (Low/High) vor Feineinstellung umschalten."""
