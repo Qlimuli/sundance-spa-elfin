@@ -64,7 +64,8 @@ CHECKS_BEFORE_RETRY   = 2   # wie HyperActiveJ-Referenz
 NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
 MAX_COMMAND_ATTEMPTS  = 32
-MAX_PENDING_CC        = 1   # max. 1 wartendes CC – kein Bus-Flooding
+MAX_PENDING_CC        = 2   # kurze Sequenz (MENU → Temp) ohne Verwurf
+PENDING_WAIT_S        = 3.0 # max. Warten bis CTS den Slot freigibt
 
 # ── Button-Codes ─────────────────────────────────────────────────────────────
 BTN_TEMP_UP        = 225
@@ -555,19 +556,53 @@ class SpaClient:
         self._writer.write(packet)
         await self._writer.drain()
 
+    async def _wait_pending_clear(self, timeout: float = PENDING_WAIT_S) -> bool:
+        """Wartet, bis die Pending-Queue leer ist (CTS hat gesendet) oder Timeout."""
+        elapsed = 0.0
+        while elapsed < timeout:
+            async with self._pending_lock:
+                if not self._pending:
+                    return True
+            await asyncio.sleep(0.1)
+            elapsed += 0.1
+        async with self._pending_lock:
+            left = len(self._pending)
+        if left:
+            _LOGGER.warning(
+                "Pending-CC nach %.1fs noch nicht gesendet (%d wartend, cts_own=%d)",
+                timeout,
+                left,
+                self._cts_own,
+            )
+        return left == 0
+
     async def _queue_cc(self, btn: int, mtype: int = CC_REQ, b6: int = 0) -> None:
-        """Reiht einen Tastenbefehl ein – Versand nur bei CTS auf dem Kanal."""
+        """Reiht einen Tastenbefehl ein – wartet ggf. auf freien Slot, droppt nicht sofort."""
         ch = await self._ensure_channel()
         pkt = _build_cc(btn, ch, mtype, b6)
-        async with self._pending_lock:
-            if len(self._pending) >= MAX_PENDING_CC:
-                dropped = self._pending.pop(0)
-                _LOGGER.warning(
-                    "Pending-CC verworfen (Bus-Schutz): %s",
-                    dropped[1].hex(" "),
-                )
-            self._pending.append((ch, pkt))
-            pending_n = len(self._pending)
+
+        # Slot freimachen: auf CTS warten statt ältere Befehle zu verwerfen
+        waited = 0.0
+        while waited < PENDING_WAIT_S:
+            async with self._pending_lock:
+                if len(self._pending) < MAX_PENDING_CC:
+                    self._pending.append((ch, pkt))
+                    pending_n = len(self._pending)
+                    break
+            await asyncio.sleep(0.1)
+            waited += 0.1
+        else:
+            async with self._pending_lock:
+                if len(self._pending) >= MAX_PENDING_CC:
+                    dropped = self._pending.pop(0)
+                    _LOGGER.warning(
+                        "Pending-CC verworfen nach %.1fs Wartezeit: %s",
+                        PENDING_WAIT_S,
+                        dropped[1].hex(" "),
+                    )
+                self._pending.append((ch, pkt))
+                pending_n = len(self._pending)
+
         self._cc_queued += 1
         _LOGGER.info(
             "CC eingeplant: btn=%d b6=%d dec=%d kanal=0x%02X pending=%d "
@@ -769,7 +804,6 @@ class SpaClient:
         want_high = target >= 37.0
         if high_range != want_high:
             if want_high:
-                # Klartext 201; encrypted 141/69 als Fallback falls nötig
                 await self._queue_cc(BTN_TEMP_RANGE_HI)
             else:
                 await self._queue_cc(BTN_TEMP_RANGE_LOW)
@@ -779,6 +813,7 @@ class SpaClient:
                 current_raw,
                 target,
             )
+            await self._wait_pending_clear()
             self._temp_check = CHECKS_BEFORE_RETRY
 
     async def _ensure_pumps_off_for_heating(self) -> None:
@@ -791,9 +826,11 @@ class SpaClient:
                 return
             if snap["pump1"]:
                 await self._queue_cc(BTN_PUMP1)
+                await self._wait_pending_clear()
             if snap["pump2"]:
                 await self._queue_cc(BTN_PUMP2)
-            await asyncio.sleep(1.5)
+                await self._wait_pending_clear()
+            await asyncio.sleep(0.8)
 
     async def set_temperature(self, target: float) -> None:
         """Soll-Temperatur per TEMP_UP/TEMP_DOWN-Tasten (Feedback-Schleife)."""
@@ -828,10 +865,10 @@ class SpaClient:
             if snap.get("in_menu"):
                 _LOGGER.info("Panel im Menü – sende MENU-Exit (254)")
                 await self._queue_cc(BTN_MENU)
-                await asyncio.sleep(1.5)
+                await self._wait_pending_clear()
             await self._ensure_pumps_off_for_heating()
-            # Temp-Range nur bei Bedarf; kein encrypted Range-Hack mehr
             await self._ensure_temp_range(target, snap["raw_d8"])
+            await self._wait_pending_clear()
             self._temp_done.clear()
             self._temp_check = 0
             self._command_attempts = 0
