@@ -61,8 +61,8 @@ CLIENT_TYPE_PANEL  = 0x02
 CC_REQ_ALT         = 0x17
 
 DETECT_CHANNEL_CYCLES = 5
-CHECKS_BEFORE_RETRY   = 8   # Status-Pakete zwischen Temp-Schritten
-TEMP_STEP_MIN_S       = 2.5 # Mindestabstand – Status braucht Zeit zum Setzen
+CHECKS_BEFORE_RETRY   = 10   # Status-Pakete zwischen Temp-Schritten
+TEMP_STEP_MIN_S       = 2.8 # Mindestabstand – Status braucht Zeit zum Setzen
 NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
 MAX_COMMAND_ATTEMPTS  = 80  # harte Obergrenze (kein Bus-Spam)
@@ -187,14 +187,11 @@ TEMP_UP_CODES: list[tuple[int, int, int]] = [
     (0xC6, 0x52, 0xE7),
     (0xC6, 0x49, 0xFF),
     (0xC6, 0xF0, 0x47),
-    (0xC6, 0xB2, 0x00),
 ]
 TEMP_DOWN_CODES: list[tuple[int, int, int]] = [
-    (0xC6, 0xEC, 0x59),  # Log: DOWN
-    (0xC6, 0xC8, 0x7C),  # Log: DOWN – nach EC59 den nächsten Schritt
-    (0xC6, 0x97, 0x21),
-    (0xC6, 0xEC, 0x59),  # erneut in Rotation für >2 Schritte
+    (0xC6, 0xEC, 0x59),
     (0xC6, 0xC8, 0x7C),
+    (0xC6, 0x97, 0x21),
 ]
 MSG_SET_TEMP = 0x20
 TEMP_UP_C6 = tuple((b, x) for m, b, x in TEMP_UP_CODES if m == 0xC6)
@@ -406,6 +403,8 @@ class SpaClient:
         self._temp_blacklist_down: set = set()
         self._last_temp_code: tuple | None = None
         self._temp_steps_done = 0
+        self._temp_fail_on_code = 0
+        self._temp_code_idx = 0
         self._temp_same_code_retries = 0
         self._last_rx_ts = 0.0
         self._last_status_ts = 0.0
@@ -848,41 +847,35 @@ class SpaClient:
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Nächsten Temp-Schritt senden.
-
-        Wichtig: Derselbe C6-Code wirkt oft nur 1×. Nach Fortschritt muss
-        der *nächste* Code der Liste kommen (nicht dauerhaft locken).
-        """
+        """Ein Temp-Frame. code_idx nur bei echtem Fortschritt oder nach Max-Retries."""
         codes = list(TEMP_UP_CODES if warmer else TEMP_DOWN_CODES)
         bl = self._temp_blacklist_up if warmer else self._temp_blacklist_down
-        codes = [c for c in codes if c not in bl] or list(
-            TEMP_UP_CODES if warmer else TEMP_DOWN_CODES
-        )
+        codes = [c for c in codes if c not in bl]
+        if not codes:
+            if warmer:
+                self._temp_blacklist_up.clear()
+            else:
+                self._temp_blacklist_down.clear()
+            codes = list(TEMP_UP_CODES if warmer else TEMP_DOWN_CODES)
 
-        # Index = Anzahl erfolgreicher Schritte (+ Retries auf aktuellem Code)
-        steps_done = getattr(self, "_temp_steps_done", 0)
-        retries = getattr(self, "_temp_same_code_retries", 0)
-        # Nach 4 erfolglosen Wiederholungen desselben Codes → nächsten nehmen
-        idx = (steps_done + (1 if retries >= 4 else 0)) % len(codes)
-        if retries >= 4:
-            self._temp_same_code_retries = 0
-            self._temp_steps_done = steps_done + 1  # force advance
-            steps_done = self._temp_steps_done
-            idx = steps_done % len(codes)
-
+        idx = int(getattr(self, "_temp_code_idx", 0)) % len(codes)
         mtype, btn, b6 = codes[idx]
         label = "TEMP_UP" if warmer else "TEMP_DOWN"
         self._assigned_channel = CMD_CHANNEL
+
         now = time.monotonic()
         wait = TEMP_STEP_MIN_S - (now - self._last_temp_cmd_ts)
         if wait > 0:
             await asyncio.sleep(wait)
         await self._wait_pending_clear(timeout=2.5)
+
         _LOGGER.warning(
-            "Temp-Schritt %s code[%d/%d] mtype=0x%02X btn=0x%02X b6=0x%02X "
-            "attempt=%d steps_ok=%d retry_same=%d",
+            "Temp-Schritt %s idx=%d/%d mtype=0x%02X btn=0x%02X b6=0x%02X "
+            "attempt=%d steps_ok=%d fail_on_code=%d",
             label, idx, len(codes), mtype, btn, b6,
-            self._command_attempts + 1, steps_done, retries,
+            self._command_attempts + 1,
+            getattr(self, "_temp_steps_done", 0),
+            getattr(self, "_temp_fail_on_code", 0),
         )
         self._last_temp_idx = idx
         self._last_temp_code = (mtype, btn, b6)
@@ -890,11 +883,10 @@ class SpaClient:
         await self._queue_cc(btn, mtype, b6)
         self._last_temp_cmd_ts = time.monotonic()
         self._command_attempts += 1
-        self._temp_same_code_retries = retries + 1
 
 
     async def _handle_temp_feedback(self, status: dict) -> None:
-        """Nach jedem +0,5° zum nächsten Code wechseln (C6 ist oft One-Shot)."""
+        """Fortschritt → steps_ok++; nach 3 Failures auf gleichem Code → idx++."""
         if self._temp_check > 0:
             self._temp_check -= 1
         if self._temp_check > 0 or self._target_temp == NO_CHANGE_REQUESTED:
@@ -905,7 +897,7 @@ class SpaClient:
             self._target_temp = NO_CHANGE_REQUESTED
             self._temp_done.set()
             _LOGGER.warning(
-                "Soll-Temperatur erreicht: %.1f °C | steps=%d sent=%d",
+                "Soll-Temperatur erreicht: %.1f °C | steps_ok=%d sent=%d",
                 current, getattr(self, "_temp_steps_done", 0), self._cc_sent,
             )
             return
@@ -919,27 +911,29 @@ class SpaClient:
         err_now = abs(self._target_temp - current)
         moved = abs(delta) >= 0.25
         code = getattr(self, "_last_temp_code", None)
+        codes = TEMP_UP_CODES if self._last_temp_warmer else TEMP_DOWN_CODES
 
         if moved and err_now < err_prev - 0.15:
-            # Fortschritt: Schritt zählen, Code wechseln, Retries reset
             self._temp_steps_done = getattr(self, "_temp_steps_done", 0) + 1
-            self._temp_same_code_retries = 0
-            self._temp_no_progress = 0
+            self._temp_fail_on_code = 0
+            # Nächsten Code für den nächsten 0,5°-Schritt
+            self._temp_code_idx = (getattr(self, "_temp_code_idx", 0) + 1) % max(len(codes), 1)
             _LOGGER.warning(
-                "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code=%s "
-                "steps_ok=%d – nächster Code",
-                prev, current, self._target_temp, code, self._temp_steps_done,
+                "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code=%s steps_ok=%d "
+                "next_idx=%d",
+                prev, current, self._target_temp, code,
+                self._temp_steps_done, self._temp_code_idx,
             )
             self._last_temp_seen = current
-            # Pause, dann anderen Code für den nächsten 0,5°-Schritt
-            self._temp_check = max(CHECKS_BEFORE_RETRY, 6)
+            self._temp_no_progress = 0
+            self._temp_check = max(CHECKS_BEFORE_RETRY, 8)
             warmer = self._target_temp > current
             await self._send_temp_step(warmer)
             return
 
         if moved and err_now > err_prev + 0.15:
             _LOGGER.warning(
-                "Temp GEGEN Ziel: %.1f → %.1f code=%s – BLACKLIST + nächster",
+                "Temp GEGEN Ziel: %.1f → %.1f code=%s – blacklist + next",
                 prev, current, code,
             )
             if code is not None:
@@ -947,24 +941,32 @@ class SpaClient:
                     self._temp_blacklist_up.add(code)
                 else:
                     self._temp_blacklist_down.add(code)
-            self._temp_same_code_retries = 99  # force code switch
+            self._temp_code_idx = (getattr(self, "_temp_code_idx", 0) + 1) % max(len(codes), 1)
+            self._temp_fail_on_code = 0
             self._last_temp_seen = current
             self._temp_no_progress += 1
         else:
+            # Kein Fortschritt: Fail-Zähler; nach 3× anderen Code
+            self._temp_fail_on_code = getattr(self, "_temp_fail_on_code", 0) + 1
             self._temp_no_progress += 1
-            if self._temp_no_progress <= 2 or self._temp_no_progress % 6 == 0:
+            if self._temp_fail_on_code >= 3:
+                self._temp_code_idx = (getattr(self, "_temp_code_idx", 0) + 1) % max(len(codes), 1)
                 _LOGGER.warning(
-                    "Temp no_change set=%.1f ziel=%.1f n=%d att=%d "
-                    "steps_ok=%d retry_same=%d code=%s",
-                    current, self._target_temp, self._temp_no_progress,
-                    self._command_attempts,
+                    "Temp Code wirkungslos → wechsle idx=%d (fail=%d)",
+                    self._temp_code_idx, self._temp_fail_on_code,
+                )
+                self._temp_fail_on_code = 0
+            elif self._temp_no_progress <= 3 or self._temp_no_progress % 5 == 0:
+                _LOGGER.warning(
+                    "Temp no_change set=%.1f ziel=%.1f fail=%d steps_ok=%d "
+                    "idx=%d code=%s",
+                    current, self._target_temp, self._temp_fail_on_code,
                     getattr(self, "_temp_steps_done", 0),
-                    getattr(self, "_temp_same_code_retries", 0),
-                    code,
+                    getattr(self, "_temp_code_idx", 0), code,
                 )
 
         steps_left = abs(self._target_temp - current) / 0.5
-        max_att = max(MAX_COMMAND_ATTEMPTS, int(steps_left) * 20 + 40)
+        max_att = max(MAX_COMMAND_ATTEMPTS, int(steps_left) * 15 + 30)
         if self._command_attempts >= max_att:
             _LOGGER.error(
                 "Temperatur abgebrochen | aktuell=%.1f Ziel=%.1f "
@@ -1198,6 +1200,8 @@ class SpaClient:
             self._last_temp_code = None
             self._temp_steps_done = 0
             self._temp_same_code_retries = 0
+            self._temp_code_idx = 0
+            self._temp_fail_on_code = 0
             self._last_temp_seen = snap["set_temp"]
             self._temp_start = snap["set_temp"]
             self._target_temp = target
