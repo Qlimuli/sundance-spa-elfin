@@ -1013,11 +1013,24 @@ class SpaClient:
             ))
             return
 
-        if moved and err_now > err_prev + 0.15:
+        wrong_direction = moved and ((delta > 0) != warmer_needed)
+
+        if wrong_direction:
             _LOGGER.warning("Temp GEGEN Ziel: %.1f → %.1f code=%s", prev, current, code)
             if code is not None:
                 bl.add(code)
                 self._c6_score[code] = self._c6_score.get(code, 0) - 2
+            self._last_temp_seen = current
+            self._temp_no_progress += 1
+            self._temp_fail_on_code = 0
+        elif moved:
+            # Richtige Richtung, nur zu großer Schritt (Overshoot) –
+            # Code NICHT sperren, nur neu ausrichten (Richtung kann sich
+            # jetzt umkehren, siehe warmer_needed beim nächsten Aufruf).
+            _LOGGER.warning(
+                "Temp Overshoot (richtige Richtung, zu groß): %.1f → %.1f (Ziel %.1f) code=%s",
+                prev, current, self._target_temp, code,
+            )
             self._last_temp_seen = current
             self._temp_no_progress += 1
             self._temp_fail_on_code = 0
