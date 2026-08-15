@@ -511,19 +511,25 @@ class SpaClient:
                     ):
                         self._pick_idle_channel()
 
-                # Panel-Sniff: physische Tastendrücke loggen (wichtig für Temp/Licht-Codes)
-                if (
-                    self._sniff_panel_cc
-                    and len(msg) >= 7
-                    and channel != self._assigned_channel
-                ):
+                # Panel-Sniff: ALLE CC (auch ch 0x10 – Panel teilt oft denselben Kanal)
+                if self._sniff_panel_cc and len(msg) >= 7:
                     btn_b5 = msg[5]
                     b6 = msg[6] if len(msg) > 6 else 0
                     decoded = btn_b5 ^ b6 ^ 1
-                    if decoded != 224:  # BTN_NA
+                    is_echo = (
+                        self._last_cc_hex is not None
+                        and msg.hex(" ") == self._last_cc_hex
+                    )
+                    if not is_echo and decoded != 224:  # BTN_NA
+                        src = (
+                            "EIGEN"
+                            if channel == self._assigned_channel
+                            else "PANEL"
+                        )
                         _LOGGER.info(
-                            "PANEL-TASTE erkannt | ch=0x%02X mtype=0x%02X "
+                            "CC-TASTE %s | ch=0x%02X mtype=0x%02X "
                             "btn=%d b6=%d dec=%d raw=%s",
+                            src,
                             channel,
                             mtype,
                             btn_b5,
@@ -531,6 +537,34 @@ class SpaClient:
                             decoded,
                             msg.hex(" "),
                         )
+
+            # Unbekannte Message-Typen loggen (Touch-Panel kann anderes nutzen)
+            elif (
+                self._sniff_panel_cc
+                and mtype
+                not in (
+                    CLEAR_TO_SEND,
+                    CLIENT_CLEAR_TO_SEND,
+                    MSG_CHANNEL_ASSIGN,
+                    MSG_EXISTING_CLIENT_REQ,
+                    STATUS_UPDATE,
+                    STATUS_UPDATE_ALT,
+                    LIGHTS_UPDATE,
+                    LIGHTS_UPDATE_ALT,
+                    CC_REQ,
+                    CC_REQ_ALT,
+                    0x07,  # NOTHING_TO_SEND
+                )
+                and len(msg) >= 5
+            ):
+                _LOGGER.info(
+                    "BUS-MSG unbekannt | ch=0x%02X mid=0x%02X mtype=0x%02X len=%d raw=%s",
+                    channel,
+                    msg[3] if len(msg) > 3 else 0,
+                    mtype,
+                    len(msg),
+                    msg.hex(" "),
+                )
 
             # ── Status / Lights ─────────────────────────────────────────────
             if mtype in (STATUS_UPDATE, STATUS_UPDATE_ALT):
