@@ -809,39 +809,58 @@ class SpaClient:
                 )
                 and len(msg) >= 5
             ):
-                if mtype == C6_REQ and len(msg) >= 7:
-                    raw_hex = msg.hex(" ")
-                    recent = getattr(self, "_recent_tx", set())
-                    if raw_hex not in recent:
-                        # Roh-Bytes
-                        if len(msg) >= 9 and msg[1] >= 8:
-                            # ggf. encrypted (extra key byte)
-                            dec = _jacuzzi_xor_cipher(bytearray(msg), encrypt=False)
-                            _LOGGER.warning(
-                                "PANEL-SNIFF C6-ENC | raw=%s decrypted=%s "
-                                "btn=0x%02X b6=0x%02X",
-                                raw_hex, bytes(dec).hex(" "),
-                                dec[6] if len(dec) > 6 else 0,
-                                dec[7] if len(dec) > 7 else 0,
-                            )
-                            btn, b6 = msg[6], msg[7] if len(msg) > 7 else 0
-                            self._note_bus(
-                                f"C6-ENC btn=0x{btn:02X} b6=0x{b6:02X} {raw_hex}"
-                            )
-                        else:
-                            btn, b6 = msg[5], msg[6] if len(msg) > 6 else 0
-                            _LOGGER.warning(
-                                "PANEL-SNIFF C6 | ch=0x%02X btn=0x%02X b6=0x%02X "
-                                "xor=0x%02X sum=0x%02X raw=%s",
-                                channel, btn, b6, btn ^ b6, (btn + b6) & 0xFF, raw_hex,
-                            )
-                            self._note_bus(
-                                f"C6 ch=0x{channel:02X} btn=0x{btn:02X} "
-                                f"b6=0x{b6:02X} {raw_hex}"
-                            )
-                        self._panel_c6_recent.append((time.monotonic(), btn, b6))
-                        if len(self._panel_c6_recent) > 80:
-                            self._panel_c6_recent = self._panel_c6_recent[-60:]
+                raw_hex = msg.hex(" ")
+                recent = getattr(self, "_recent_tx", set())
+                is_ours = raw_hex in recent
+
+                if mtype == C6_REQ and len(msg) >= 7 and not is_ours:
+                    if len(msg) >= 9 and msg[1] >= 8:
+                        # ggf. encrypted (extra key byte)
+                        dec = _jacuzzi_xor_cipher(bytearray(msg), encrypt=False)
+                        _LOGGER.warning(
+                            "PANEL-SNIFF C6-ENC | raw=%s decrypted=%s "
+                            "btn=0x%02X b6=0x%02X",
+                            raw_hex, bytes(dec).hex(" "),
+                            dec[6] if len(dec) > 6 else 0,
+                            dec[7] if len(dec) > 7 else 0,
+                        )
+                        btn, b6 = msg[6], msg[7] if len(msg) > 7 else 0
+                        self._note_bus(
+                            f"C6-ENC btn=0x{btn:02X} b6=0x{b6:02X} {raw_hex}"
+                        )
+                    else:
+                        btn, b6 = msg[5], msg[6] if len(msg) > 6 else 0
+                        _LOGGER.warning(
+                            "PANEL-SNIFF C6 | ch=0x%02X btn=0x%02X b6=0x%02X "
+                            "xor=0x%02X sum=0x%02X raw=%s",
+                            channel, btn, b6, btn ^ b6, (btn + b6) & 0xFF, raw_hex,
+                        )
+                        self._note_bus(
+                            f"C6 ch=0x{channel:02X} btn=0x{btn:02X} "
+                            f"b6=0x{b6:02X} {raw_hex}"
+                        )
+                    self._panel_c6_recent.append((time.monotonic(), btn, b6))
+                    if len(self._panel_c6_recent) > 80:
+                        self._panel_c6_recent = self._panel_c6_recent[-60:]
+                elif mtype == C7_REQ and len(msg) >= 9:
+                    # Cameo Licht-Befehl (verschlüsselt)
+                    if not is_ours:
+                        dec = _jacuzzi_xor_cipher(bytearray(msg), encrypt=False)
+                        btn = dec[6] if len(dec) > 6 else 0
+                        b6 = dec[7] if len(dec) > 7 else 0
+                        _LOGGER.warning(
+                            "PANEL-SNIFF C7 | ch=0x%02X key=0x%02X "
+                            "btn=0x%02X b6=0x%02X raw=%s",
+                            channel, msg[5], btn, b6, raw_hex,
+                        )
+                        self._note_bus(
+                            f"C7 PANEL btn=0x{btn:02X} b6=0x{b6:02X} {raw_hex}"
+                        )
+                    else:
+                        self._note_bus(f"C7 EIGEN {raw_hex}")
+                elif mtype == C2_UPDATE:
+                    # Licht-Stream während Blend – nur Ringpuffer
+                    self._note_bus(f"C2 {raw_hex}")
                 else:
                     # Unbekannte Typen immer im Ringpuffer (auch ohne debug_cmd)
                     self._note_bus(
@@ -1075,34 +1094,44 @@ class SpaClient:
 
 
     async def _queue_raw(self, pkt: bytes) -> None:
-        """Reiht ein fertiges Paket ein (z.B. Direct-Set 0x20)."""
+        """Reiht ein fertiges Paket ein (C7/C6/Direct-Set). Nie still verwerfen."""
         ch = await self._ensure_channel()
-        # Kanal im Paket ggf. anpassen (Byte 2)
+        # Kanal im Paket ggf. anpassen (Byte 2) + CS neu
         if len(pkt) > 2:
             ba = bytearray(pkt)
             ba[2] = ch & 0xFF
-            # Checksum neu (ml = ba[1], cs an Position ml)
             ml = ba[1]
             if len(ba) > ml:
                 ba[ml] = _calc_cs(ba[1:ml], ml - 1)
             pkt = bytes(ba)
+
         waited = 0.0
         while waited < PENDING_WAIT_S:
             async with self._pending_lock:
                 if len(self._pending) < MAX_PENDING_CC:
                     self._pending.append((ch, pkt))
-                    self._cc_queued += 1
-                    _LOGGER.warning(
-                        "RAW eingeplant ch=0x%02X: %s", ch, pkt.hex(" ")
-                    )
-                    return
+                    pending_n = len(self._pending)
+                    break
             await asyncio.sleep(0.1)
             waited += 0.1
-        async with self._pending_lock:
-            if len(self._pending) < MAX_PENDING_CC:
+        else:
+            # Timeout: ältestes verwerfen und trotzdem einreihen (wie _queue_cc)
+            async with self._pending_lock:
+                if len(self._pending) >= MAX_PENDING_CC:
+                    dropped = self._pending.pop(0)
+                    _LOGGER.warning(
+                        "Pending-RAW verworfen nach %.1fs: %s",
+                        PENDING_WAIT_S,
+                        dropped[1].hex(" "),
+                    )
                 self._pending.append((ch, pkt))
-                self._cc_queued += 1
+                pending_n = len(self._pending)
 
+        self._cc_queued += 1
+        _LOGGER.warning(
+            "RAW eingeplant ch=0x%02X pending=%d queued=%d: %s",
+            ch, pending_n, self._cc_queued, pkt.hex(" "),
+        )
     async def send_blower_toggle(self) -> None:
         """Blubber ein/aus – verschlüsseltes Panel-CC (53/217)."""
         await self._queue_cc(BLOWER_CC_BTN, CC_REQ, BLOWER_CC_B6)
@@ -1435,8 +1464,14 @@ class SpaClient:
 
 
     async def _send_light_step(self, color: bool = False) -> None:
-        """Licht Cameo: C7 0x2F/0x33 (Panel-Sniff). Farbe-Fallback CC 0xF2."""
-        if self._light_attempt >= 12:
+        """Licht Cameo: C7 0x2F/0x33 (Panel-Sniff, byte-identisch).
+
+        Strategie:
+          0-7:  encrypted C7 (Panel-Format, wechselnder Key)
+          8-11: unencrypted C7 (ml=7, wie Temp-C6-Klartext)
+          12+:  CC btn=241 (klassischer Light-Button)
+        """
+        if self._light_attempt >= 16:
             _LOGGER.error("Licht-Versuche erschöpft – Abbruch")
             self._target_light_brightness = LIGHT_NO_CHANGE
             self._target_light_mode = LIGHT_NO_CHANGE
@@ -1445,27 +1480,44 @@ class SpaClient:
             self._light_done.set()
             return
         self._assigned_channel = CMD_CHANNEL
-        await self._wait_pending_clear(timeout=2.0)
+        await self._wait_pending_clear(timeout=1.5)
+        attempt = self._light_attempt
+
         if color:
             _LOGGER.warning(
                 "Licht-Befehl COLOR mtype=0xCC btn=0xF2 attempt=%d ch=0x10",
-                self._light_attempt + 1,
+                attempt + 1,
             )
             await self._queue_cc(0xF2, CC_REQ, 0x00)
-        else:
-            key_byte = (self._light_attempt * 0x17) & 0xFF
+        elif attempt < 8:
+            # Encrypted C7 – exakt wie Panel (verifiziert byte-identisch)
+            key_byte = ((attempt + 1) * 0x17 + 0x04) & 0xFF
             pkt = _build_c7(
                 LIGHT_C7_BTN, LIGHT_C7_B6, CMD_CHANNEL, key_byte=key_byte
             )
             _LOGGER.warning(
-                "Licht-Befehl C7 btn=0x%02X b6=0x%02X key=0x%02X attempt=%d pkt=%s",
-                LIGHT_C7_BTN,
-                LIGHT_C7_B6,
-                key_byte,
-                self._light_attempt + 1,
-                pkt.hex(" "),
+                "Licht-Befehl C7-ENC btn=0x%02X b6=0x%02X key=0x%02X "
+                "attempt=%d pkt=%s",
+                LIGHT_C7_BTN, LIGHT_C7_B6, key_byte, attempt + 1, pkt.hex(" "),
             )
             await self._queue_raw(pkt)
+            await self._wait_pending_clear(timeout=2.0)
+        elif attempt < 12:
+            # Unencrypted C7 (ml=7) – analog zu funktionierendem Temp-C6-Klartext
+            pkt = _build_cc(LIGHT_C7_BTN, CMD_CHANNEL, C7_REQ, LIGHT_C7_B6)
+            _LOGGER.warning(
+                "Licht-Befehl C7-PLAIN btn=0x%02X b6=0x%02X attempt=%d pkt=%s",
+                LIGHT_C7_BTN, LIGHT_C7_B6, attempt + 1, pkt.hex(" "),
+            )
+            await self._queue_raw(pkt)
+            await self._wait_pending_clear(timeout=2.0)
+        else:
+            # Klassischer CC Light-Button als letzter Fallback
+            _LOGGER.warning(
+                "Licht-Befehl CC-FALLBACK btn=%d attempt=%d",
+                BTN_LIGHT, attempt + 1,
+            )
+            await self._queue_cc(BTN_LIGHT, CC_REQ, 0)
         self._light_attempt += 1
 
     async def _handle_light_feedback(self, lights: dict) -> None:
@@ -1485,28 +1537,33 @@ class SpaClient:
                 self._light_done.set()
             elif lights["brightness_raw"] == 0:
                 await self._send_light_step(color=False)
-                self._light_check = CHECKS_BEFORE_RETRY
+                self._light_check = 1  # Licht: schneller retry (CA kommt seltener)
             else:
                 await self._send_light_step(color=True)
-                self._light_check = CHECKS_BEFORE_RETRY
+                self._light_check = 1
             return
 
         if self._target_light_brightness == LIGHT_NO_CHANGE:
             return
 
-        if lights["brightness_raw"] == self._target_light_brightness:
+        cur = int(lights.get("brightness_raw") or 0)
+        tgt = int(self._target_light_brightness)
+        if cur == tgt:
             _LOGGER.warning(
-                "Licht-Helligkeit erreicht: %s (Ziel=%s)",
-                lights["brightness_raw"],
-                self._target_light_brightness,
+                "Licht-Helligkeit erreicht: %s (Ziel=%s) attempts=%d",
+                cur, tgt, self._light_attempt,
             )
             self._target_light_brightness = LIGHT_NO_CHANGE
             self._light_done.set()
             return
 
-        # Ein/Aus: gleicher Button toggelt
+        # Panel: jeder C7-Druck = +20% (0→20→40→…→100→0). Gleicher Button.
+        _LOGGER.warning(
+            "Licht noch nicht am Ziel (aktuell=%s ziel=%s) → nächster C7-Schritt",
+            cur, tgt,
+        )
         await self._send_light_step(color=False)
-        self._light_check = CHECKS_BEFORE_RETRY
+        self._light_check = 1
 
     async def send_button(self, btn: int, mtype: int = CC_REQ, b6: int = 0) -> None:
         await self._queue_cc(btn, mtype, b6)
@@ -1729,14 +1786,19 @@ class SpaClient:
                 if mode is None:
                     raise UpdateFailed(f"Unbekannter Licht-Effekt: {effect}")
                 lights = await self._lights_snapshot()
-                if not lights or lights["brightness_raw"] == 0:
+                if not lights or int(lights.get("brightness_raw") or 0) == 0:
+                    # Zuerst einschalten, dann Effekt setzen
                     self._target_light_brightness = 100
+                    await self._handle_light_feedback(
+                        lights or {"brightness_raw": 0, "mode_raw": 0, "on": False}
+                    )
                     try:
                         await asyncio.wait_for(self._light_done.wait(), timeout=30.0)
                     except asyncio.TimeoutError:
                         raise UpdateFailed("Licht konnte nicht eingeschaltet werden")
                     self._light_done.clear()
                     self._light_check = 0
+                    self._target_light_brightness = LIGHT_NO_CHANGE
                 self._target_light_mode = mode
             elif on is False or (brightness_pct is not None and brightness_pct <= 0):
                 self._target_light_brightness = 0
@@ -1750,14 +1812,22 @@ class SpaClient:
             lights = await self._lights_snapshot()
             if lights:
                 await self._handle_light_feedback(lights)
+            else:
+                # Noch kein CA-Status – trotzdem ersten Schritt senden
+                _LOGGER.warning(
+                    "set_light: kein Lights-Status vorhanden – erzwinge ersten C7"
+                )
+                await self._send_light_step(color=False)
+                self._light_check = 1
 
             try:
                 await asyncio.wait_for(self._light_done.wait(), timeout=60.0)
                 _LOGGER.info(
-                    "set_light OK | sent=%d queued=%d last_cc=%s",
+                    "set_light OK | sent=%d queued=%d last_cc=%s attempts=%d",
                     self._cc_sent,
                     self._cc_queued,
                     self._last_cc_hex,
+                    self._light_attempt,
                 )
             except asyncio.TimeoutError as exc:
                 lights = await self._lights_snapshot()
