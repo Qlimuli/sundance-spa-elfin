@@ -930,9 +930,16 @@ class SpaClient:
             codes = [(0xC6, 0xEC, 0x59), (0xC6, 0xC8, 0x7C)]
 
         bl = self._temp_blacklist_up if warmer else self._temp_blacklist_down
-        codes = [c for c in codes if c not in bl] or (
-            [(0xC6, 0xF0, 0x47)] if warmer else [(0xC6, 0xC8, 0x7C)]
-        )
+        scores = getattr(self, "_c6_score", {})
+        # WICHTIG: Blacklist/Score dürfen den Pool nie auf 1 Code
+        # reduzieren (harter Ausschluss) – sonst wird exakt derselbe
+        # Code viele Male in Folge identisch gesendet, und der Spa
+        # ignoriert offenbar wiederholte identische Pakete als Duplikat
+        # (siehe Log: 20+ identische TX ohne jede Wirkung). Blacklist
+        # wirkt daher nur noch als Priorisierung (schlechte Codes ans
+        # Ende), nie als Ausschluss – beide Basis-Codes bleiben immer
+        # im Rotationspool.
+        codes.sort(key=lambda c: (c in bl, -scores.get(c, 0)))
 
         # Rotiere nur zwischen verschiedenen Codes, nicht Spam
         idx = int(getattr(self, "_temp_code_idx", 0)) % len(codes)
@@ -995,6 +1002,8 @@ class SpaClient:
             self._temp_steps_done = getattr(self, "_temp_steps_done", 0) + 1
             if code is not None:
                 self._c6_score[code] = self._c6_score.get(code, 0) + 2
+                if hasattr(self, "_c6_wrong_streak"):
+                    self._c6_wrong_streak[code] = 0
             _LOGGER.warning(
                 "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code=%s | Pause 6s vor nächstem 0,5°-Schritt",
                 prev, current, self._target_temp, code,
@@ -1015,11 +1024,27 @@ class SpaClient:
 
         wrong_direction = moved and ((delta > 0) != warmer_needed)
 
+        if not hasattr(self, "_c6_wrong_streak"):
+            self._c6_wrong_streak = {}
+
         if wrong_direction:
-            _LOGGER.warning("Temp GEGEN Ziel: %.1f → %.1f code=%s", prev, current, code)
+            streak = self._c6_wrong_streak.get(code, 0) + 1 if code is not None else 1
             if code is not None:
+                self._c6_wrong_streak[code] = streak
+            _LOGGER.warning(
+                "Temp GEGEN Ziel: %.1f → %.1f code=%s (Streak %d/2)",
+                prev, current, code, streak,
+            )
+            # Erst nach 2x in Folge sperren – ein einzelner Ausreißer (z.B.
+            # durch überlappende Direct-Set-Reads) darf nicht sofort den
+            # Code-Pool auf einen einzigen Code reduzieren, sonst wird
+            # exakt derselbe Frame wiederholt gesendet und vom Spa als
+            # Debounce/hängende Taste ignoriert (siehe Kommentar oben:
+            # "Variation gegen Debounce identischer Frames").
+            if code is not None and streak >= 2:
                 bl.add(code)
                 self._c6_score[code] = self._c6_score.get(code, 0) - 2
+                _LOGGER.warning("Code %s nach 2x GEGEN-Ziel endgültig gesperrt", code)
             self._last_temp_seen = current
             self._temp_no_progress += 1
             self._temp_fail_on_code = 0
