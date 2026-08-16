@@ -296,6 +296,19 @@ TEMP_RANGE_HI_CC_BTN = 141
 TEMP_RANGE_HI_CC_B6  = 69
 BTN_MENU = 254
 
+# Verifiziert aus Log 10:37 DOWN 30→28 Erfolg:
+SEED_DOWN_C6: list[tuple[int, int, int]] = [
+    (0xC6, 0x15, 0xA5),
+    (0xC6, 0x74, 0xC5),
+    (0xC6, 0x8E, 0x3C),
+    (0xC6, 0x98, 0x2B),
+    (0xC6, 0xF1, 0x45),
+]
+SEED_UP_C6: list[tuple[int, int, int]] = [
+    (0xC6, 0xF0, 0x47),
+    (0xC6, 0x52, 0xE7),
+]
+
 
 
 def _build_set_temp(channel: int, celsius: float) -> bytes:
@@ -499,8 +512,8 @@ class SpaClient:
         self._light_attempt = 0
         self._debug_cmd = False
         self._recent_tx: set = set()
-        self._learned_c6_up: list = []
-        self._learned_c6_down: list = []
+        self._learned_c6_up: list = list(SEED_UP_C6)
+        self._learned_c6_down: list = list(SEED_DOWN_C6)
         self._panel_c6_recent: list = []  # (ts, btn, b6)
         self._last_set_temp_seen: float | None = None
         self._temp_locked_code = None
@@ -980,7 +993,7 @@ class SpaClient:
 
 
     def _learn_c6_from_settemp(self, new_set: float) -> None:
-        """Ordnet kürzliche Panel-C6 der Richtung der Soll-Änderung zu."""
+        """Panel-C6 der letzten 1,2s der Soll-Änderung zuordnen (nur wenn wir nicht senden)."""
         prev = self._last_set_temp_seen
         self._last_set_temp_seen = new_set
         if prev is None:
@@ -988,44 +1001,48 @@ class SpaClient:
         delta = new_set - prev
         if abs(delta) < 0.25:
             return
+        # Während eigener Steuerung nicht vom Panel lernen (sonst Selbst-Feedback)
+        if self._target_temp != NO_CHANGE_REQUESTED:
+            return
         now = time.monotonic()
-        # Panel-Codes der letzten 2 s
         recent = [
             (b, x) for (ts, b, x) in self._panel_c6_recent
-            if now - ts < 2.0
+            if now - ts < 1.2
         ]
         if not recent:
             return
-        # Nimm den neuesten Code
         btn, b6 = recent[-1]
         entry = (0xC6, btn, b6)
+        if not hasattr(self, "_c6_score"):
+            self._c6_score = {}
         if delta > 0:
             if entry not in self._learned_c6_up:
                 self._learned_c6_up.append(entry)
-                if len(self._learned_c6_up) > 30:
-                    self._learned_c6_up = self._learned_c6_up[-25:]
+            self._learned_c6_down = [c for c in self._learned_c6_down if c != entry]
+            self._c6_score[entry] = self._c6_score.get(entry, 0) + 1
             _LOGGER.warning(
-                "LEARN-UP C6 btn=0x%02X b6=0x%02X (set %.1f→%.1f) pool=%d",
+                "LEARN-UP C6 btn=0x%02X b6=0x%02X (%.1f→%.1f) pool=%d",
                 btn, b6, prev, new_set, len(self._learned_c6_up),
             )
         else:
             if entry not in self._learned_c6_down:
                 self._learned_c6_down.append(entry)
-                if len(self._learned_c6_down) > 30:
-                    self._learned_c6_down = self._learned_c6_down[-25:]
+            self._learned_c6_up = [c for c in self._learned_c6_up if c != entry]
+            self._c6_score[entry] = self._c6_score.get(entry, 0) + 1
             _LOGGER.warning(
-                "LEARN-DOWN C6 btn=0x%02X b6=0x%02X (set %.1f→%.1f) pool=%d",
+                "LEARN-DOWN C6 btn=0x%02X b6=0x%02X (%.1f→%.1f) pool=%d",
                 btn, b6, prev, new_set, len(self._learned_c6_down),
             )
 
+
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Temp: 1) gelernte C6  2) verschlüsseltes CC 225/226  3) C6 F0/EC."""
+        """Nur gelernte C6 mit positivem Score; sonst FIXED-C6 Fallback."""
         if self._assigned_channel is None:
             self._assigned_channel = CMD_CHANNEL
         ch = self._assigned_channel
 
-        if self._command_attempts > 80:
-            _LOGGER.error("Temp: >80 Versuche – Abbruch")
+        if self._command_attempts > 100:
+            _LOGGER.error("Temp: >100 Versuche – Abbruch")
             self._target_temp = NO_CHANGE_REQUESTED
             async with self._pending_lock:
                 self._pending.clear()
@@ -1033,67 +1050,45 @@ class SpaClient:
             return
 
         await self._wait_pending_clear(timeout=3.0)
-        mode = getattr(self, "_temp_send_mode", 0)  # 0=C6 learn, 1=enc CC, 2=C6 fixed
+        scores = getattr(self, "_c6_score", {})
 
         if warmer:
-            learned = list(self._learned_c6_up)
-            fixed_c6 = [(0xF0, 0x47), (0x52, 0xE7)]
-            btn_plain = BTN_TEMP_UP
+            pool = list(self._learned_c6_up)
+            fixed = [(0xC6, 0xF0, 0x47), (0xC6, 0x52, 0xE7)]
             label = "TEMP_UP"
         else:
-            learned = list(self._learned_c6_down)
-            fixed_c6 = [(0xEC, 0x59), (0xC8, 0x7C)]
-            btn_plain = BTN_TEMP_DOWN
+            pool = list(self._learned_c6_down)
+            fixed = [(0xC6, 0xEC, 0x59), (0xC6, 0xC8, 0x7C), (0xC6, 0x15, 0xA5),
+                     (0xC6, 0x74, 0xC5), (0xC6, 0x8E, 0x3C), (0xC6, 0x98, 0x2B)]
             label = "TEMP_DOWN"
 
-        idx = self._command_attempts
+        # Codes mit Score > 0 bevorzugen; neutrale (0) erlauben; negative raus
+        good = [c for c in pool if scores.get(c, 0) >= 0]
+        # Sort: höchster Score zuerst, dann rotieren
+        good.sort(key=lambda c: scores.get(c, 0), reverse=True)
+        codes = good if good else fixed
 
-        if mode == 0 and learned:
-            # Frische gelernte C6 (ohne Extra-Key, wie Panel sendet)
-            i = idx % len(learned)
-            mtype, btn, b6 = learned[i]
-            pkt = _build_cc(btn, ch, mtype, b6)  # length 7, raw C6/CC
-            _LOGGER.warning(
-                "Temp-Schritt %s LEARNED C6/CC btn=0x%02X b6=0x%02X attempt=%d",
-                label, btn, b6, idx + 1,
-            )
-            await self._queue_raw(pkt)
-        elif mode == 1 or (mode == 0 and not learned and idx >= 4):
-            # Verschlüsseltes Klartext-CC (jacuzzi_decrypt)
-            self._temp_send_mode = 1
-            pkt = _build_cc_encrypted(btn_plain, ch, CC_REQ, 0, key_byte=0)
-            _LOGGER.warning(
-                "Temp-Schritt %s ENC-CC btn=%d pkt=%s attempt=%d",
-                label, btn_plain, pkt.hex(" "), idx + 1,
-            )
-            await self._queue_raw(pkt)
-        else:
-            # Feste C6-Paare (Panel-ähnlich, length 7)
-            self._temp_send_mode = 2
-            btn, b6 = fixed_c6[idx % len(fixed_c6)]
-            pkt = _build_cc(btn, ch, 0xC6, b6)
-            _LOGGER.warning(
-                "Temp-Schritt %s FIXED-C6 btn=0x%02X b6=0x%02X attempt=%d",
-                label, btn, b6, idx + 1,
-            )
-            await self._queue_raw(pkt)
+        idx = int(getattr(self, "_temp_code_idx", 0)) % len(codes)
+        mtype, btn, b6 = codes[idx]
+        pkt = _build_cc(btn, ch, mtype, b6)
 
-        self._last_temp_code = (label, mode)
+        _LOGGER.warning(
+            "Temp-Schritt %s btn=0x%02X b6=0x%02X score=%s idx=%d/%d attempt=%d pool=%d",
+            label, btn, b6, scores.get((mtype, btn, b6), 0),
+            idx, len(codes), self._command_attempts + 1, len(pool),
+        )
+        self._last_temp_code = (mtype, btn, b6)
         self._last_temp_warmer = warmer
+        await self._queue_raw(pkt)
         self._last_temp_cmd_ts = time.monotonic()
         self._command_attempts += 1
-        # Alle 8 Versuche Modus wechseln
-        if self._command_attempts % 8 == 0:
-            self._temp_send_mode = (getattr(self, "_temp_send_mode", 0) + 1) % 3
-            _LOGGER.warning("Temp-Modus wechsel → %d", self._temp_send_mode)
+        self._temp_code_idx = idx + 1
 
 
     async def _handle_temp_feedback(self, status: dict) -> None:
-        """Wie HyperActiveJ: bei jedem Status prüfen, ggf. TEMP_UP/DOWN senden."""
+        """Score gelernte Codes; bei Fortschritt Pause; bei GEGEN aus Pool."""
         if self._target_temp == NO_CHANGE_REQUESTED:
             return
-
-        # checkCounter wie Referenz
         if self._temp_check > 0:
             self._temp_check -= 1
             return
@@ -1101,14 +1096,77 @@ class SpaClient:
         current = float(status["set_temp"])
         if abs(current - self._target_temp) < 0.3:
             _LOGGER.warning(
-                "Soll-Temperatur erreicht: %.1f °C (Ziel %.1f) attempts=%d",
-                current, self._target_temp, self._command_attempts,
+                "Soll-Temperatur erreicht: %.1f °C attempts=%d",
+                current, self._command_attempts,
             )
             self._target_temp = NO_CHANGE_REQUESTED
             self._temp_done.set()
             return
 
-        if self._command_attempts > 64:
+        if self._last_temp_seen is None:
+            self._last_temp_seen = current
+
+        prev = self._last_temp_seen
+        delta = current - prev
+        err_prev = abs(self._target_temp - prev)
+        err_now = abs(self._target_temp - current)
+        moved = abs(delta) >= 0.25
+        code = getattr(self, "_last_temp_code", None)
+        warmer_needed = self._target_temp > current
+        if not hasattr(self, "_c6_score"):
+            self._c6_score = {}
+
+        if moved and err_now < err_prev - 0.15:
+            # Fortschritt → Code belohnen, in richtiger Liste halten
+            if code is not None:
+                self._c6_score[code] = self._c6_score.get(code, 0) + 3
+                if warmer_needed or delta > 0:
+                    if code not in self._learned_c6_up:
+                        self._learned_c6_up.append(code)
+                    # aus DOWN entfernen wenn fälschlich dort
+                    self._learned_c6_down = [c for c in self._learned_c6_down if c != code]
+                if (not warmer_needed) or delta < 0:
+                    if code not in self._learned_c6_down:
+                        self._learned_c6_down.append(code)
+                    self._learned_c6_up = [c for c in self._learned_c6_up if c != code]
+            self._temp_steps_done = getattr(self, "_temp_steps_done", 0) + 1
+            _LOGGER.warning(
+                "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code=%s score=%s | Pause 2s",
+                prev, current, self._target_temp, code,
+                self._c6_score.get(code, 0) if code else 0,
+            )
+            self._last_temp_seen = current
+            self._temp_check = 4
+            await asyncio.sleep(2.0)
+            if self._target_temp == NO_CHANGE_REQUESTED:
+                return
+            await self._send_temp_step(self._target_temp > current)
+            return
+
+        if moved and err_now > err_prev + 0.15:
+            # GEGEN → abstrafen und aus aktueller Richtungsliste
+            if code is not None:
+                self._c6_score[code] = self._c6_score.get(code, 0) - 5
+                if warmer_needed:
+                    self._learned_c6_up = [c for c in self._learned_c6_up if c != code]
+                    if code not in self._learned_c6_down:
+                        self._learned_c6_down.append(code)
+                else:
+                    self._learned_c6_down = [c for c in self._learned_c6_down if c != code]
+                    if code not in self._learned_c6_up:
+                        self._learned_c6_up.append(code)
+            _LOGGER.warning(
+                "Temp GEGEN: %.1f → %.1f code=%s → umsortiert score=%s",
+                prev, current, code,
+                self._c6_score.get(code, 0) if code else 0,
+            )
+            self._last_temp_seen = current
+        else:
+            # keine Bewegung
+            if code is not None:
+                self._c6_score[code] = self._c6_score.get(code, 0) - 1
+
+        if self._command_attempts >= 100:
             _LOGGER.error(
                 "set_temperature TIMEOUT | Ziel=%.1f got=%.1f attempts=%d",
                 self._target_temp, current, self._command_attempts,
@@ -1119,15 +1177,8 @@ class SpaClient:
             self._temp_done.set()
             return
 
-        warmer = self._target_temp > current
-        _LOGGER.warning(
-            "Temp-STATUS set=%.1f ziel=%.1f → sende %s",
-            current, self._target_temp,
-            "TEMP_UP" if warmer else "TEMP_DOWN",
-        )
-        self._last_temp_seen = current
-        await self._send_temp_step(warmer)
-        self._temp_check = CHECKS_BEFORE_RETRY
+        await self._send_temp_step(self._target_temp > current)
+        self._temp_check = 3
 
 
     async def _try_direct_set(self, target: float) -> None:
