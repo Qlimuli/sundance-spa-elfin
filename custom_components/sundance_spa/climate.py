@@ -34,7 +34,8 @@ class SpaClimate(CoordinatorEntity, ClimateEntity):
     _attr_has_entity_name      = True
     _attr_name                 = "Thermostat"
     _attr_temperature_unit     = UnitOfTemperature.CELSIUS
-    _attr_min_temp             = 20.0
+    # Cameo 880: High-Range oft ab ~28 °C; Low-Range ~26.5 – UI ab 26.5
+    _attr_min_temp             = 26.5
     _attr_max_temp             = 40.0
     _attr_target_temperature_step = 0.5
     _attr_hvac_modes           = [HVACMode.HEAT, HVACMode.OFF]
@@ -48,7 +49,7 @@ class SpaClimate(CoordinatorEntity, ClimateEntity):
             identifiers={(DOMAIN, entry.entry_id)},
             name="Sundance Spa",
             manufacturer="Sundance / Balboa",
-            model="RS485-TCP",
+            model="Cameo 880 (RS485-TCP)",
         )
 
     @property
