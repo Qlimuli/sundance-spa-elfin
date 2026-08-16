@@ -334,12 +334,27 @@ SEED_UP_C6: list[tuple[int, int, int]] = [
 # Direct-Set 0x20 oft ignoriert → C6 primär, CC Fallback, 0x20 selten.
 TEMP_STALL_BEFORE_FALLBACK = 5
 TEMP_MAX_ATTEMPTS = 28
+TEMP_MAX_ATTEMPTS_HIGH = 42       # High-Range: mehr Exploration statt denselben Code zu hämmern
 TEMP_LEARN_POOL_MAX = 16
+TEMP_BUCKET_POOL_MAX = 12
 TEMP_RANGE_JUMP_C = 2.5
+TEMP_LEARN_STRONG_DELTA = 0.5
+TEMP_LEARN_WEAK_DELTA = 1.0
+TEMP_EXPLORATION_AFTER = 3         # nach N erfolglosen C6-Versuchen gezielt neue Codes testen
+TEMP_STRONG_LOCK_SCORE = 12
 TEMP_FLOOR_PROBE = 4
 TEMP_STATUS_WAIT = 5              # Status-Frames warten nach TX (~1–1.5s)
 TEMP_MIN_STEP_GAP = 0.9           # min. Sekunden zwischen Temp-Befehlen
 TEMP_SPA_FLOOR_C = 28.0           # typisches Cameo-Minimum (High-Range)
+
+# Temperaturabhängige C6-Lernbereiche. Der Pool ist absichtlich nicht global: 
+# Codes aus dem 28-32°C-Bereich sollen bei 36-39°C nicht mehr bevorzugt werden.
+TEMP_BUCKETS: tuple[tuple[float, float], ...] = (
+    (26.0, 29.0),
+    (29.0, 33.0),
+    (33.0, 37.0),
+    (37.0, 40.5),
+)
 
 
 
@@ -550,7 +565,17 @@ class SpaClient:
         self._recent_tx: set = set()
         self._learned_c6_up: list = list(SEED_UP_C6)
         self._learned_c6_down: list = list(SEED_DOWN_C6)
-        self._panel_c6_recent: list = []  # (ts, btn, b6)
+        # Bucket-basierte Pools: direction -> bucket -> [C6 entries]
+        self._c6_buckets: dict[str, dict[int, list]] = {
+            "up": {i: [] for i in range(len(TEMP_BUCKETS))},
+            "down": {i: [] for i in range(len(TEMP_BUCKETS))},
+        }
+        self._c6_bucket_score: dict[tuple[int, int, int, int], int] = {}
+        self._c6_bucket_last_seen: dict[tuple[int, int, int, int], float] = {}
+        self._temp_exploration_round = 0
+        self._temp_target_bucket: int | None = None
+        self._temp_current_bucket: int | None = None
+        self._panel_c6_recent: list = []  # (ts, btn, b6, observed_temp)
         self._last_set_temp_seen: float | None = None
         self._temp_locked_code = None
         self._c6_score: dict = {}
@@ -569,6 +594,60 @@ class SpaClient:
         # Problematische DOWN-Codes von Anfang an blacklisten
         for bad in TEMP_DOWN_BAD:
             self._temp_blacklist_down.add(bad)
+        self._seed_c6_buckets()
+
+    def _temp_bucket(self, temp: float) -> int:
+        """Liefert den Temperatur-Bucket; Grenzwerte sind halboffen."""
+        for idx, (low, high) in enumerate(TEMP_BUCKETS):
+            if low <= temp < high:
+                return idx
+        if temp < TEMP_BUCKETS[0][0]:
+            return 0
+        return len(TEMP_BUCKETS) - 1
+
+    def _bucket_label(self, bucket: int) -> str:
+        low, high = TEMP_BUCKETS[max(0, min(bucket, len(TEMP_BUCKETS) - 1))]
+        return f"{low:.0f}-{high:.1f}"
+
+    def _seed_c6_buckets(self) -> None:
+        """Verteilt bekannte Seeds in passende Temperaturbereiche."""
+        seed_ranges_up = (31.0, 31.5, 32.0, 32.5, 33.0, 33.5, 39.0, 38.5)
+        seed_ranges_down = (28.5, 29.0, 29.5, 30.0, 30.5, 31.0, 31.5, 32.0)
+        for entry, temp in zip(SEED_UP_C6, seed_ranges_up):
+            b = self._temp_bucket(temp)
+            if entry not in self._c6_buckets["up"][b]:
+                self._c6_buckets["up"][b].append(entry)
+        for entry, temp in zip(SEED_DOWN_C6, seed_ranges_down):
+            b = self._temp_bucket(temp)
+            if entry not in self._c6_buckets["down"][b]:
+                self._c6_buckets["down"][b].append(entry)
+
+    def _add_c6_to_bucket(self, warmer: bool, entry: tuple[int, int, int], temp: float, score_delta: int = 0) -> int:
+        direction = "up" if warmer else "down"
+        bucket = self._temp_bucket(temp)
+        pool = self._c6_buckets[direction][bucket]
+        if entry in pool:
+            pool.remove(entry)
+        pool.append(entry)
+        del_count = max(0, len(pool) - TEMP_BUCKET_POOL_MAX)
+        if del_count:
+            del pool[:del_count]
+        key = (1 if warmer else 0, bucket, entry[1], entry[2])
+        self._c6_bucket_score[key] = self._c6_bucket_score.get(key, 0) + score_delta
+        self._c6_bucket_last_seen[key] = time.monotonic()
+        return bucket
+
+    def _remove_c6_from_buckets(self, entry: tuple[int, int, int]) -> None:
+        for direction in ("up", "down"):
+            for pool in self._c6_buckets[direction].values():
+                if entry in pool:
+                    pool.remove(entry)
+
+    def _adaptive_temp_attempts(self, target: float | None = None) -> int:
+        target = self._target_temp if target is None else target
+        if target is not None and target >= 33.0:
+            return TEMP_MAX_ATTEMPTS_HIGH
+        return TEMP_MAX_ATTEMPTS
 
     async def connect(self) -> None:
         self._reader, self._writer = await asyncio.open_connection(
@@ -821,7 +900,7 @@ class SpaClient:
                             f"C6 ch=0x{channel:02X} btn=0x{btn:02X} "
                             f"b6=0x{b6:02X} {raw_hex}"
                         )
-                    self._panel_c6_recent.append((time.monotonic(), btn, b6))
+                    self._panel_c6_recent.append((time.monotonic(), btn, b6, float(self._status.get("set_temp")) if self._status and self._status.get("set_temp") is not None else None))
                     if len(self._panel_c6_recent) > 80:
                         self._panel_c6_recent = self._panel_c6_recent[-60:]
                 elif mtype == C7_REQ and len(msg) >= 9:
@@ -1112,90 +1191,149 @@ class SpaClient:
 
 
     def _learn_c6_from_settemp(self, new_set: float) -> None:
-        """Panel-C6 der letzten 1,2s zuordnen. Nur echte 0,5°-Schritte, Pool begrenzt."""
+        """Ordnet echte Panel-C6-Temperaturschritte einem Temperatur-Bucket zu.
+
+        0.5°C wird stark gelernt, 1.0°C nur schwach. Große Sprünge werden als
+        Range/Unit-Umschaltung behandelt. Ein während einer laufenden Automation
+        empfangener C6 wird nicht als Panel-Learning gewertet.
+        """
         prev = self._last_set_temp_seen
         self._last_set_temp_seen = new_set
         if prev is None:
             return
         delta = new_set - prev
-        if abs(delta) < 0.25:
-            return
-        # Range High/Low oder Unit-Toggle – kein Temp-Step
-        if abs(delta) >= TEMP_RANGE_JUMP_C:
-            _LOGGER.warning(
-                "LEARN skip (Range/Unit?): %.1f→%.1f Δ=%.1f", prev, new_set, delta
-            )
+        abs_delta = abs(delta)
+        if abs_delta < 0.25 or abs_delta >= TEMP_RANGE_JUMP_C:
+            if abs_delta >= TEMP_RANGE_JUMP_C:
+                _LOGGER.warning(
+                    "LEARN skip (Range/Unit?): %.1f→%.1f Δ=%.1f", prev, new_set, delta
+                )
             return
         if self._target_temp != NO_CHANGE_REQUESTED:
             return
+
         now = time.monotonic()
         recent = [
-            (b, x) for (ts, b, x) in self._panel_c6_recent
-            if now - ts < 1.2
+            item for item in self._panel_c6_recent
+            if now - item[0] < 1.2
         ]
         if not recent:
             return
-        btn, b6 = recent[-1]
+        ts, btn, b6, observed_temp = recent[-1]
         entry = (0xC6, btn, b6)
-        if not hasattr(self, "_c6_score"):
-            self._c6_score = {}
-        if delta > 0:
-            self._learned_c6_down = [c for c in self._learned_c6_down if c != entry]
+
+        # Derive the bucket from the actual step, not merely the current target.
+        step_temp = min(prev, new_set) if delta < 0 else prev
+        bucket = self._temp_bucket(step_temp)
+        strong = abs_delta <= TEMP_LEARN_STRONG_DELTA + 0.01
+        weak = abs_delta <= TEMP_LEARN_WEAK_DELTA + 0.01
+        if not weak:
+            return
+        score_delta = 5 if strong else 1
+        direction = delta > 0
+
+        self._remove_c6_from_buckets(entry)
+        self._add_c6_to_bucket(direction, entry, step_temp, score_delta)
+        if direction:
+            if entry in self._learned_c6_down:
+                self._learned_c6_down.remove(entry)
             if entry in self._learned_c6_up:
                 self._learned_c6_up.remove(entry)
             self._learned_c6_up.append(entry)
             self._learned_c6_up = self._learned_c6_up[-TEMP_LEARN_POOL_MAX:]
-            self._c6_score[entry] = max(self._c6_score.get(entry, 0), 0) + 3
             self._temp_blacklist_up.discard(entry)
-            # Frischer Panel-Code: Blacklist der Richtung etwas auflockern
-            if len(self._temp_blacklist_up) > 8:
-                self._temp_blacklist_up.clear()
-            _LOGGER.warning(
-                "LEARN-UP C6 btn=0x%02X b6=0x%02X (%.1f→%.1f) pool=%d",
-                btn, b6, prev, new_set, len(self._learned_c6_up),
-            )
         else:
-            self._learned_c6_up = [c for c in self._learned_c6_up if c != entry]
+            if entry in self._learned_c6_up:
+                self._learned_c6_up.remove(entry)
             if entry in self._learned_c6_down:
                 self._learned_c6_down.remove(entry)
             self._learned_c6_down.append(entry)
             self._learned_c6_down = self._learned_c6_down[-TEMP_LEARN_POOL_MAX:]
-            self._c6_score[entry] = max(self._c6_score.get(entry, 0), 0) + 3
             self._temp_blacklist_down.discard(entry)
-            if len(self._temp_blacklist_down) > 8:
-                self._temp_blacklist_down.clear()
-            _LOGGER.warning(
-                "LEARN-DOWN C6 btn=0x%02X b6=0x%02X (%.1f→%.1f) pool=%d",
-                btn, b6, prev, new_set, len(self._learned_c6_down),
-            )
 
+        self._c6_score[entry] = max(self._c6_score.get(entry, 0), 0) + score_delta
+        self._c6_bucket_last_seen[(1 if direction else 0, bucket, btn, b6)] = now
+        if self._c6_score[entry] >= TEMP_STRONG_LOCK_SCORE:
+            self._temp_locked_code = entry
+
+        _LOGGER.warning(
+            "LEARN-%s C6 btn=0x%02X b6=0x%02X %.1f→%.1f Δ=%.1f "
+            "bucket=%s strength=%s score=%d",
+            "UP" if direction else "DOWN", btn, b6, prev, new_set, delta,
+            self._bucket_label(bucket), "strong" if strong else "weak",
+            self._c6_score[entry],
+        )
 
     def _temp_blacklist(self, warmer: bool) -> set:
         return self._temp_blacklist_up if warmer else self._temp_blacklist_down
 
     def _pick_temp_codes(self, warmer: bool) -> list[tuple[int, int, int]]:
-        """Lock-Code zuerst, dann neueste gelernte C6 (ohne Blacklist)."""
-        scores = getattr(self, "_c6_score", {})
+        """Bucket-basierte C6-Auswahl mit Lock, Nachbar-Buckets und Exploration."""
+        direction = "up" if warmer else "down"
         bl = self._temp_blacklist(warmer)
-        pool = list(self._learned_c6_up if warmer else self._learned_c6_down)
+        scores = getattr(self, "_c6_score", {})
+        target = float(self._target_temp)
+        current = float(self._last_temp_seen if self._last_temp_seen is not None else target)
+        target_bucket = self._temp_bucket(target)
+        current_bucket = self._temp_bucket(current)
+        self._temp_target_bucket = target_bucket
+        self._temp_current_bucket = current_bucket
+
         candidates: list[tuple[int, int, int]] = []
         locked = getattr(self, "_temp_locked_code", None)
         if (
-            locked
-            and isinstance(locked, tuple)
-            and len(locked) == 3
-            and locked[0] == 0xC6
-            and locked not in bl
+            locked and isinstance(locked, tuple) and len(locked) == 3
+            and locked[0] == 0xC6 and locked not in bl
         ):
-            candidates.append(locked)
-        for c in reversed(pool):
-            if c in bl or c in candidates:
-                continue
-            if scores.get(c, 0) < -3:
-                continue
-            candidates.append(c)
-            if len(candidates) >= 8:
-                break
+            # Ein Lock wird nur bevorzugt, wenn er aus dem Ziel-/Nachbarbereich stammt.
+            lock_bucket_ok = any(
+                locked in self._c6_buckets[direction][b]
+                for b in range(len(TEMP_BUCKETS))
+                if abs(b - target_bucket) <= 1
+            )
+            if lock_bucket_ok:
+                candidates.append(locked)
+
+        # Ziel-Bucket zuerst, dann genau ein Nachbar-Bucket. Bei hoher Temperatur
+        # bekommt Exploration bewusst Vorrang vor alten Low-Range-Codes.
+        bucket_order = [target_bucket]
+        if target_bucket > 0:
+            bucket_order.append(target_bucket - 1)
+        if target_bucket + 1 < len(TEMP_BUCKETS):
+            bucket_order.append(target_bucket + 1)
+
+        for bucket in bucket_order:
+            pool = list(self._c6_buckets[direction][bucket])
+            pool.sort(
+                key=lambda c: (
+                    scores.get(c, 0),
+                    self._c6_bucket_last_seen.get(
+                        (1 if warmer else 0, bucket, c[1], c[2]), 0.0
+                    ),
+                ),
+                reverse=True,
+            )
+            for code in pool:
+                if code in bl or code in candidates or scores.get(code, 0) < -3:
+                    continue
+                candidates.append(code)
+                if len(candidates) >= 8:
+                    return candidates
+
+        # Exploration: bekannte Seed-/Panel-Codes aus dem Zielbereich nur dann
+        # wiederverwenden, wenn der aktuelle Pool keinen Fortschritt liefert.
+        if self._temp_stall_rounds >= TEMP_EXPLORATION_AFTER:
+            self._temp_exploration_round += 1
+            for bucket in bucket_order:
+                for code in self._c6_buckets[direction][bucket]:
+                    if code in bl or code in candidates:
+                        continue
+                    candidates.append(code)
+                    if len(candidates) >= 8:
+                        break
+                if len(candidates) >= 8:
+                    break
+
         return candidates
 
     async def _send_temp_step(self, warmer: bool) -> None:
@@ -1203,8 +1341,9 @@ class SpaClient:
         if self._assigned_channel is None:
             self._assigned_channel = CMD_CHANNEL
 
-        if self._command_attempts >= TEMP_MAX_ATTEMPTS:
-            _LOGGER.error("Temp: >=%d Versuche – Abbruch", TEMP_MAX_ATTEMPTS)
+        max_attempts = self._adaptive_temp_attempts()
+        if self._command_attempts >= max_attempts:
+            _LOGGER.error("Temp: >=%d Versuche – Abbruch", max_attempts)
             self._target_temp = NO_CHANGE_REQUESTED
             async with self._pending_lock:
                 self._pending.clear()
@@ -1345,7 +1484,7 @@ class SpaClient:
                 self._target_temp = NO_CHANGE_REQUESTED
                 self._temp_done.set()
                 return
-            if self._command_attempts >= TEMP_MAX_ATTEMPTS:
+            if self._command_attempts >= self._adaptive_temp_attempts():
                 _LOGGER.error(
                     "set_temperature TIMEOUT | Ziel=%.1f got=%.1f attempts=%d",
                     self._target_temp, current, self._command_attempts,
@@ -1376,20 +1515,29 @@ class SpaClient:
             self._temp_stall_rounds = 0
             self._temp_fail_on_code = 0
             if is_c6:
-                self._temp_locked_code = code
                 self._c6_score[code] = self._c6_score.get(code, 0) + 5
-                if delta > 0:
+                step_bucket = self._temp_bucket(prev)
+                direction = delta > 0
+                self._remove_c6_from_buckets(code)
+                self._add_c6_to_bucket(direction, code, prev, 5)
+                if direction:
                     if code not in self._learned_c6_up:
                         self._learned_c6_up.append(code)
                     self._learned_c6_down = [c for c in self._learned_c6_down if c != code]
                     self._temp_blacklist_down.discard(code)
                     self._temp_blacklist_up.discard(code)
-                elif delta < 0:
+                else:
                     if code not in self._learned_c6_down:
                         self._learned_c6_down.append(code)
                     self._learned_c6_up = [c for c in self._learned_c6_up if c != code]
                     self._temp_blacklist_up.discard(code)
                     self._temp_blacklist_down.discard(code)
+                if self._c6_score[code] >= TEMP_STRONG_LOCK_SCORE:
+                    self._temp_locked_code = code
+                    _LOGGER.warning(
+                        "Temp-C6 STRONG-LOCK code=%s bucket=%s score=%d",
+                        code, self._bucket_label(step_bucket), self._c6_score[code],
+                    )
             self._temp_steps_done = getattr(self, "_temp_steps_done", 0) + 1
             _LOGGER.warning(
                 "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code=%s score=%s%s | Pause",
@@ -1419,9 +1567,11 @@ class SpaClient:
                 if wanted_warmer:
                     self._temp_blacklist_up.add(code)
                     self._learned_c6_up = [c for c in self._learned_c6_up if c != code]
+                    self._remove_c6_from_buckets(code)
                 else:
                     self._temp_blacklist_down.add(code)
                     self._learned_c6_down = [c for c in self._learned_c6_down if c != code]
+                    self._remove_c6_from_buckets(code)
             _LOGGER.warning(
                 "Temp GEGEN: %.1f → %.1f code=%s blacklist stall=%d",
                 prev, current, code, self._temp_stall_rounds,
@@ -1458,7 +1608,7 @@ class SpaClient:
                 self._temp_done.set()
                 return
 
-        if self._command_attempts >= TEMP_MAX_ATTEMPTS:
+        if self._command_attempts >= self._adaptive_temp_attempts():
             # Nahe am Floor und Ziel darunter → als Floor werten, kein TIMEOUT-Fehler
             if (
                 not warmer_needed
@@ -1706,6 +1856,8 @@ class SpaClient:
             self._temp_progress_at = 0
             self._temp_code_idx = 0
             self._temp_fail_on_code = 0
+            self._temp_exploration_round = 0
+            self._temp_target_bucket = self._temp_bucket(target)
             # Lock behalten wenn Richtung passt, sonst neu lernen
             locked = getattr(self, "_temp_locked_code", None)
             warmer = target > snap["set_temp"]
@@ -1717,9 +1869,12 @@ class SpaClient:
 
             _LOGGER.warning(
                 "set_temperature START | Ziel=%.1f aktuell=%.1f kanal=0x%02X "
-                "| Modus=C6-Lock→CC→0x20 pool_up=%d pool_down=%d lock=%s",
+                "| Modus=C6-Bucket/Learn→CC→0x20 pool_up=%d pool_down=%d "
+                "target_bucket=%s max_attempts=%d lock=%s",
                 target, snap["set_temp"], ch,
                 len(self._learned_c6_up), len(self._learned_c6_down),
+                self._bucket_label(self._temp_target_bucket),
+                self._adaptive_temp_attempts(target),
                 self._temp_locked_code,
             )
 
