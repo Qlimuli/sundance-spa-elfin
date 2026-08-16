@@ -69,7 +69,7 @@ NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
 MAX_COMMAND_ATTEMPTS  = 80  # harte Obergrenze (kein Bus-Spam)
 MAX_PENDING_CC        = 1   # nur 1 Befehl auf dem Bus – schont Panel
-PENDING_WAIT_S        = 4.0 # max. Warten bis CTS den Slot freigibt
+PENDING_WAIT_S        = 1.5 # max. Warten bis CTS; danach Force-Send
 
 # ── Button-Codes ─────────────────────────────────────────────────────────────
 BTN_TEMP_UP        = 225
@@ -351,13 +351,16 @@ SEED_UP_C6: list[tuple[int, int, int]] = [
     (0xC6, 0x67, 0xA1),  # 38.5→39.0
 ]
 
-# Cameo: C6-Codes sind sitzungsabhängig; frische Codes + Lock bei Erfolg.
-# Direct-Set 0x20 wird vom Board oft ignoriert → C6 primär, CC/0x20 Fallback.
-TEMP_STALL_BEFORE_FALLBACK = 4
-TEMP_MAX_ATTEMPTS = 40
-TEMP_LEARN_POOL_MAX = 16          # neueste Panel-/Erfolgs-Codes
-TEMP_RANGE_JUMP_C = 2.5           # >= 2.5°C = Range/Unit, kein 0.5°-Step
-TEMP_FLOOR_PROBE = 3              # nach N Downs ohne Bewegung unter aktueller Temp → Floor
+# Cameo: C6-Codes sitzungsabhängig; Lock bei Erfolg; Rate-Limit gegen Burst.
+# Direct-Set 0x20 oft ignoriert → C6 primär, CC Fallback, 0x20 selten.
+TEMP_STALL_BEFORE_FALLBACK = 5
+TEMP_MAX_ATTEMPTS = 28
+TEMP_LEARN_POOL_MAX = 16
+TEMP_RANGE_JUMP_C = 2.5
+TEMP_FLOOR_PROBE = 4
+TEMP_STATUS_WAIT = 5              # Status-Frames warten nach TX (~1–1.5s)
+TEMP_MIN_STEP_GAP = 0.9           # min. Sekunden zwischen Temp-Befehlen
+TEMP_SPA_FLOOR_C = 28.0           # typisches Cameo-Minimum (High-Range)
 
 
 
@@ -1225,7 +1228,7 @@ class SpaClient:
         return candidates
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """C6 (Lock/frisch) primär → Klartext-CC → Direct-Set. Pending nie blockieren."""
+        """C6 primär → CC → selten Direct. Rate-Limit + Pending-Flush."""
         if self._assigned_channel is None:
             self._assigned_channel = CMD_CHANNEL
 
@@ -1237,18 +1240,26 @@ class SpaClient:
             self._temp_done.set()
             return
 
-        await self._wait_pending_clear(timeout=2.5)
+        # Rate-Limit: nicht schneller als TEMP_MIN_STEP_GAP senden
+        last_ts = getattr(self, "_last_temp_cmd_ts", 0.0) or 0.0
+        gap = time.monotonic() - last_ts
+        if gap < TEMP_MIN_STEP_GAP:
+            await asyncio.sleep(TEMP_MIN_STEP_GAP - gap)
+
+        await self._wait_pending_clear(timeout=PENDING_WAIT_S)
 
         stall = getattr(self, "_temp_stall_rounds", 0)
-        # Runden-basiert: C6 → alle 4 Stalls CC → alle 8 Stalls Direct
-        use_cc = stall >= TEMP_STALL_BEFORE_FALLBACK and (stall % 2 == 0)
-        use_direct = stall >= TEMP_STALL_BEFORE_FALLBACK * 2 and (stall % 3 == 0)
+        # CC ab stall≥5, Direct nur sehr spät und selten
+        use_cc = stall >= TEMP_STALL_BEFORE_FALLBACK and (stall % 3 != 0)
+        use_direct = stall >= TEMP_STALL_BEFORE_FALLBACK * 3 and (stall % 5 == 0)
 
         if use_direct:
             await self._try_direct_set(self._target_temp)
             self._last_temp_code = ("direct", 0x20, 0)
             self._last_temp_warmer = warmer
+            self._last_temp_cmd_ts = time.monotonic()
             self._command_attempts += 1
+            self._temp_check = TEMP_STATUS_WAIT
             return
 
         if use_cc:
@@ -1262,20 +1273,28 @@ class SpaClient:
             await self._queue_cc(btn, CC_REQ, 0)
             self._last_temp_cmd_ts = time.monotonic()
             self._command_attempts += 1
+            self._temp_check = TEMP_STATUS_WAIT
             return
 
         codes = self._pick_temp_codes(warmer)
         if not codes:
-            # Pool leer (alles blacklisted) → Blacklist leeren, Seeds nutzen
             bl = self._temp_blacklist(warmer)
             bl.clear()
+            # Seeds wieder in Pool
+            seeds = SEED_UP_C6 if warmer else SEED_DOWN_C6
+            pool = self._learned_c6_up if warmer else self._learned_c6_down
+            for s in seeds:
+                if s not in pool:
+                    pool.append(s)
             codes = self._pick_temp_codes(warmer)
         if not codes:
             btn = BTN_TEMP_UP if warmer else BTN_TEMP_DOWN
             self._last_temp_code = (0xCC, btn, 0)
             self._last_temp_warmer = warmer
             await self._queue_cc(btn, CC_REQ, 0)
+            self._last_temp_cmd_ts = time.monotonic()
             self._command_attempts += 1
+            self._temp_check = TEMP_STATUS_WAIT
             return
 
         idx = int(getattr(self, "_temp_code_idx", 0)) % len(codes)
@@ -1295,7 +1314,7 @@ class SpaClient:
         await self._queue_raw(pkt)
         self._last_temp_cmd_ts = time.monotonic()
         self._command_attempts += 1
-        # Bei Lock denselben Code behalten, sonst rotieren
+        self._temp_check = TEMP_STATUS_WAIT
         if not locked:
             self._temp_code_idx = idx + 1
 
@@ -1347,7 +1366,7 @@ class SpaClient:
         )
 
         if moved and err_now < err_prev - 0.15:
-            # Erfolg → Code locken und behalten
+            # Erfolg → nur C6 locken
             self._temp_stall_rounds = 0
             self._temp_fail_on_code = 0
             if is_c6:
@@ -1367,20 +1386,25 @@ class SpaClient:
                     self._temp_blacklist_down.discard(code)
             self._temp_steps_done = getattr(self, "_temp_steps_done", 0) + 1
             _LOGGER.warning(
-                "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code=%s score=%s LOCK | Pause 1.2s",
+                "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code=%s score=%s%s | Pause",
                 prev, current, self._target_temp, code,
                 self._c6_score.get(code, 0) if is_c6 else "-",
+                " LOCK" if is_c6 else "",
             )
             self._last_temp_seen = current
-            self._temp_check = 2
-            await asyncio.sleep(1.2)
+            self._temp_check = TEMP_STATUS_WAIT
+            await asyncio.sleep(0.8)
             if self._target_temp == NO_CHANGE_REQUESTED:
+                return
+            if abs(current - self._target_temp) < 0.3:
+                self._target_temp = NO_CHANGE_REQUESTED
+                self._temp_done.set()
                 return
             await self._send_temp_step(self._target_temp > current)
             return
 
         if moved and err_now > err_prev + 0.15:
-            # GEGEN → Unlock + Blacklist
+            # GEGEN → Unlock + Blacklist; große Sprünge = stärkere Pause
             self._temp_stall_rounds = getattr(self, "_temp_stall_rounds", 0) + 1
             self._temp_locked_code = None
             if is_c6:
@@ -1397,34 +1421,27 @@ class SpaClient:
                 prev, current, code, self._temp_stall_rounds,
             )
             self._last_temp_seen = current
+            self._temp_check = TEMP_STATUS_WAIT + 2
+            if abs(delta) >= 1.5:
+                await asyncio.sleep(1.0)
         else:
             # keine Bewegung
             self._temp_stall_rounds = getattr(self, "_temp_stall_rounds", 0) + 1
             if is_c6:
                 self._c6_score[code] = self._c6_score.get(code, 0) - 1
-                # Nach mehreren Fehlversuchen denselben Code unlocken
                 if getattr(self, "_temp_locked_code", None) == code:
                     self._temp_fail_on_code = getattr(self, "_temp_fail_on_code", 0) + 1
-                    if self._temp_fail_on_code >= 3:
-                        _LOGGER.warning("Temp-Lock gelöst nach 3 Fehlversuchen: %s", code)
+                    if self._temp_fail_on_code >= 2:
+                        _LOGGER.warning("Temp-Lock gelöst nach 2 Fehlversuchen: %s", code)
                         self._temp_locked_code = None
                         self._temp_fail_on_code = 0
 
-            # Spa-Minimum (Floor): mehrmals DOWN ohne Bewegung unter aktueller Temp
+            # Spa-Floor: Ziel unter Minimum (~28°C High-Range)
             if (
                 not warmer_needed
                 and not moved
                 and self._temp_stall_rounds >= TEMP_FLOOR_PROBE
-                and abs(current - self._target_temp) > 0.3
-                and current <= self._target_temp + 0.5
-            ):
-                # wir sind schon am/unter Ziel – ok
-                pass
-            elif (
-                not warmer_needed
-                and not moved
-                and self._temp_stall_rounds >= TEMP_FLOOR_PROBE + 2
-                and current <= 28.5
+                and current <= TEMP_SPA_FLOOR_C + 1.5
                 and self._target_temp < current - 0.2
             ):
                 _LOGGER.warning(
@@ -1436,10 +1453,21 @@ class SpaClient:
                 return
 
         if self._command_attempts >= TEMP_MAX_ATTEMPTS:
-            _LOGGER.error(
-                "set_temperature TIMEOUT | Ziel=%.1f got=%.1f attempts=%d",
-                self._target_temp, current, self._command_attempts,
-            )
+            # Nahe am Floor und Ziel darunter → als Floor werten, kein TIMEOUT-Fehler
+            if (
+                not warmer_needed
+                and current <= TEMP_SPA_FLOOR_C + 1.5
+                and self._target_temp < current
+            ):
+                _LOGGER.warning(
+                    "Temp-Floor (Timeout): ist=%.1f Ziel=%.1f – akzeptiere",
+                    current, self._target_temp,
+                )
+            else:
+                _LOGGER.error(
+                    "set_temperature TIMEOUT | Ziel=%.1f got=%.1f attempts=%d",
+                    self._target_temp, current, self._command_attempts,
+                )
             self._target_temp = NO_CHANGE_REQUESTED
             async with self._pending_lock:
                 self._pending.clear()
@@ -1447,7 +1475,7 @@ class SpaClient:
             return
 
         await self._send_temp_step(self._target_temp > current)
-        self._temp_check = 2
+        self._temp_check = TEMP_STATUS_WAIT
 
 
     async def _try_direct_set(self, target: float) -> None:
