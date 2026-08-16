@@ -61,11 +61,8 @@ CLIENT_TYPE_PANEL  = 0x02
 CC_REQ_ALT         = 0x17
 
 DETECT_CHANNEL_CYCLES = 5
-CHECKS_BEFORE_RETRY   = 15   # Status-Pakete zwischen Temp-Schritten
-TEMP_STEP_MIN_S       = 5.0 # Mindestabstand – Status braucht Zeit zum Setzen
-PHASE0_STEP_S         = 2.0  # Phase 0: schnelles Nachfassen nach Erfolg
-PHASE_MAX_ATTEMPTS    = 6    # Versuche pro Phase ohne Netto-Fortschritt,
-                              # bevor zur nächsten Fallback-Stufe eskaliert wird
+CHECKS_BEFORE_RETRY   = 2   # Status-Pakete zwischen Temp-Schritten
+TEMP_STEP_MIN_S       = 0.5 # Mindestabstand – Status braucht Zeit zum Setzen
 NO_CHANGE_REQUESTED   = -1.0
 LIGHT_NO_CHANGE       = -1
 MAX_COMMAND_ATTEMPTS  = 80  # harte Obergrenze (kein Bus-Spam)
@@ -922,248 +919,15 @@ class SpaClient:
             )
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Ein einzelner Tastendruck. Nie denselben Code spammen."""
-        if warmer:
-            codes = [(0xC6, 0xF0, 0x47)]
-            # Frische gelernte UP-Codes (höchster Score) optional
-            for c in list(self._learned_c6_up)[-3:]:
-                if c not in codes and getattr(self, "_c6_score", {}).get(c, 0) >= 1:
-                    codes.append(c)
-        else:
-            codes = [(0xC6, 0xEC, 0x59), (0xC6, 0xC8, 0x7C)]
-            # Fallback-Stufe 2: echte, vom Panel gesniffte Codes sind
-            # zuverlässiger als die zwei festverdrahteten Rate-Codes.
-            # (UP nutzt diesen Lern-Pool bereits – DOWN fehlte er bisher.)
-            for c in list(getattr(self, "_learned_c6_down", []))[-3:]:
-                if c not in codes and getattr(self, "_c6_score", {}).get(c, 0) >= 1:
-                    codes.append(c)
-
-        bl = self._temp_blacklist_up if warmer else self._temp_blacklist_down
-        scores = getattr(self, "_c6_score", {})
-        # WICHTIG: Blacklist/Score dürfen den Pool nie auf 1 Code
-        # reduzieren (harter Ausschluss) – sonst wird exakt derselbe
-        # Code viele Male in Folge identisch gesendet, und der Spa
-        # ignoriert offenbar wiederholte identische Pakete als Duplikat
-        # (siehe Log: 20+ identische TX ohne jede Wirkung). Blacklist
-        # wirkt daher nur noch als Priorisierung (schlechte Codes ans
-        # Ende), nie als Ausschluss – beide Basis-Codes bleiben immer
-        # im Rotationspool.
-        codes.sort(key=lambda c: (c in bl, -scores.get(c, 0)))
-
-        # WICHTIG: idx wird NICHT mehr nach jedem Versand automatisch
-        # weitergedreht. Vorher wurde nach einem erfolgreichen Schritt
-        # sofort zum jeweils anderen Code gewechselt – genau das hat in
-        # den Live-Logs das Oszillieren "Erfolg → GEGEN Ziel → Erfolg
-        # → GEGEN Ziel" zwischen den beiden Codes erzeugt, weil der
-        # gerade funktionierende Code nie zweimal hintereinander benutzt
-        # wurde. codes[0] ist nach dem sort() oben immer der aktuell
-        # beste (höchster Score, nicht blacklisted) Code – der wird
-        # standardmäßig wiederverwendet. Rotation passiert nur noch
-        # gezielt in den Fehlerzweigen von _handle_temp_feedback.
-        idx = int(getattr(self, "_temp_code_idx", 0)) % len(codes)
-        mtype, btn, b6 = codes[idx]
+        """HyperActiveJ-kompatibel: nur Klartext CC TEMP_UP=225 / TEMP_DOWN=226."""
+        btn = BTN_TEMP_UP if warmer else BTN_TEMP_DOWN
         label = "TEMP_UP" if warmer else "TEMP_DOWN"
-        ch = self._assigned_channel or CMD_CHANNEL
+        if self._assigned_channel is None:
+            self._assigned_channel = CMD_CHANNEL
 
-        now = time.monotonic()
-        wait = TEMP_STEP_MIN_S - (now - self._last_temp_cmd_ts)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        await self._wait_pending_clear(timeout=4.0)
-
-        _LOGGER.warning(
-            "Temp-Schritt %s btn=0x%02X b6=0x%02X attempt=%d half_steps=%d",
-            label, btn, b6,
-            self._command_attempts + 1,
-            getattr(self, "_temp_steps_done", 0),
-        )
-        self._last_temp_code = (mtype, btn, b6)
-        self._last_temp_warmer = warmer
-        await self._queue_cc(btn, mtype, b6)
-        self._last_temp_cmd_ts = time.monotonic()
-        self._command_attempts += 1
-
-
-    async def _handle_temp_feedback(self, status: dict) -> None:
-        """0,5-Grad-Schritte: nach Fortschritt lange Pause, kein Code-Spam."""
-        if self._temp_check > 0:
-            self._temp_check -= 1
-        if self._temp_check > 0 or self._target_temp == NO_CHANGE_REQUESTED:
-            return
-
-        current = float(status["set_temp"])
-        if abs(current - self._target_temp) < 0.3:
-            self._target_temp = NO_CHANGE_REQUESTED
-            self._temp_done.set()
-            _LOGGER.warning(
-                "Soll-Temperatur erreicht: %.1f °C | half_steps=%d",
-                current, getattr(self, "_temp_steps_done", 0),
-            )
-            return
-
-        if self._last_temp_seen is None:
-            self._last_temp_seen = current
-
-        prev = self._last_temp_seen
-        delta = current - prev
-        err_prev = abs(self._target_temp - prev)
-        err_now = abs(self._target_temp - current)
-        moved = abs(delta) >= 0.25
-        code = getattr(self, "_last_temp_code", None)
-        warmer_needed = self._target_temp > current
-        bl = self._temp_blacklist_up if warmer_needed else self._temp_blacklist_down
-        if not hasattr(self, "_c6_score"):
-            self._c6_score = {}
-
-        phase = getattr(self, "_temp_phase", 0)
-        if not hasattr(self, "_temp_phase_baseline") or self._temp_phase_baseline is None:
-            self._temp_phase_baseline = prev
-        if not hasattr(self, "_temp_phase_attempts"):
-            self._temp_phase_attempts = 0
-
-        if moved and err_now < err_prev - 0.15:
-            self._temp_steps_done = getattr(self, "_temp_steps_done", 0) + 1
-            if code is not None:
-                self._c6_score[code] = self._c6_score.get(code, 0) + 2
-                if hasattr(self, "_c6_wrong_streak"):
-                    self._c6_wrong_streak[code] = 0
-            self._last_temp_seen = current
-            self._temp_no_progress = 0
-            self._temp_fail_on_code = 0
-            # Echter Netto-Fortschritt (nicht nur ein einzelner Schritt,
-            # der später wieder zurückspringt) verschiebt die Phasen-
-            # Baseline und setzt den Eskalations-Zähler zurück.
-            if abs(self._target_temp - current) < abs(self._target_temp - self._temp_phase_baseline) - 0.15:
-                self._temp_phase_baseline = current
-                self._temp_phase_attempts = 0
-
-            if phase == 0:
-                # PHASE 0: schnelles Nachfassen – denselben (gerade
-                # erfolgreichen) Code zeitnah wiederholen, um das
-                # Zeitfenster vor einem möglichen Zurückspringen des
-                # angezeigten Sollwerts zu treffen. idx bleibt bewusst
-                # unverändert (kein Rotieren weg vom Erfolg).
-                _LOGGER.warning(
-                    "Temp-Fortschritt [Phase 0]: %.1f → %.1f (Ziel %.1f) code=%s | "
-                    "Pause %.1fs, gleicher Code wird wiederholt",
-                    prev, current, self._target_temp, code, PHASE0_STEP_S,
-                )
-                self._temp_check = 20
-                await asyncio.sleep(PHASE0_STEP_S)
-            else:
-                # PHASE 1 (Fallback): klassisches Verhalten – lange
-                # Pause, danach zum jeweils anderen Code wechseln.
-                _LOGGER.warning(
-                    "Temp-Fortschritt [Phase 1]: %.1f → %.1f (Ziel %.1f) code=%s | "
-                    "Pause 6s, wechsle Code",
-                    prev, current, self._target_temp, code,
-                )
-                self._temp_code_idx = getattr(self, "_temp_code_idx", 0) + 1
-                self._temp_check = 20
-                await asyncio.sleep(6.0)
-
-            if self._target_temp == NO_CHANGE_REQUESTED:
-                return
-            await self._send_temp_step(self._target_temp > current)
-            return
-
-        wrong_direction = moved and ((delta > 0) != warmer_needed)
-
-        if not hasattr(self, "_c6_wrong_streak"):
-            self._c6_wrong_streak = {}
-
-        if wrong_direction:
-            streak = self._c6_wrong_streak.get(code, 0) + 1 if code is not None else 1
-            if code is not None:
-                self._c6_wrong_streak[code] = streak
-            _LOGGER.warning(
-                "Temp GEGEN Ziel [Phase %d]: %.1f → %.1f code=%s (Streak %d/2)",
-                phase, prev, current, code, streak,
-            )
-            # Erst nach 2x in Folge sperren – ein einzelner Ausreißer (z.B.
-            # durch überlappende Direct-Set-Reads) darf nicht sofort den
-            # Code-Pool auf einen einzigen Code reduzieren, sonst wird
-            # exakt derselbe Frame wiederholt gesendet und vom Spa als
-            # Debounce/hängende Taste ignoriert. Blacklist wirkt (siehe
-            # _send_temp_step) ohnehin nur als Priorisierung, nie als
-            # harter Ausschluss.
-            if code is not None and streak >= 2:
-                bl.add(code)
-                self._c6_score[code] = self._c6_score.get(code, 0) - 2
-                _LOGGER.warning("Code %s nach 2x GEGEN-Ziel geringer priorisiert", code)
-            self._last_temp_seen = current
-            self._temp_no_progress += 1
-            self._temp_fail_on_code = 0
-            self._temp_phase_attempts += 1
-        elif moved:
-            # Richtige Richtung, nur zu großer Schritt (Overshoot) –
-            # Code NICHT sperren, nur neu ausrichten (Richtung kann sich
-            # jetzt umkehren, siehe warmer_needed beim nächsten Aufruf).
-            _LOGGER.warning(
-                "Temp Overshoot [Phase %d] (richtige Richtung, zu groß): %.1f → %.1f (Ziel %.1f) code=%s",
-                phase, prev, current, self._target_temp, code,
-            )
-            self._last_temp_seen = current
-            self._temp_no_progress += 1
-            self._temp_fail_on_code = 0
-            self._temp_phase_attempts += 1
-        else:
-            self._temp_fail_on_code = getattr(self, "_temp_fail_on_code", 0) + 1
-            self._temp_no_progress += 1
-            self._temp_phase_attempts += 1
-            # Nach 4 Failures: anderen Code, kurze Extra-Pause
-            if self._temp_fail_on_code >= 4:
-                self._temp_fail_on_code = 0
-                self._temp_code_idx = getattr(self, "_temp_code_idx", 0) + 1
-                await asyncio.sleep(2.0)
-
-        # ── Phasen-Eskalation ────────────────────────────────────────
-        # Wenn eine Phase PHASE_MAX_ATTEMPTS Versuche lang keinen echten
-        # Netto-Fortschritt gegenüber ihrer eigenen Baseline zeigt
-        # (Oszillation ohne Konvergenz zählt NICHT als Fortschritt),
-        # wird zur nächsten Fallback-Stufe eskaliert:
-        #   0 → 1: von schnellem Nachfassen zu klassischem Alternieren
-        #   1 → 2: Kanal wird neu angefordert (harter Reset des
-        #          RS485-Client-Zustands), dann zurück zu Phase 1
-        if self._temp_phase_attempts >= PHASE_MAX_ATTEMPTS:
-            self._temp_phase_attempts = 0
-            self._temp_phase_baseline = current
-            if phase == 0:
-                self._temp_phase = 1
-                _LOGGER.warning(
-                    "Strategie-Wechsel: Phase 0 (schnelles Nachfassen) ohne "
-                    "Fortschritt → wechsle zu Phase 1 (klassisches Alternieren)"
-                )
-            elif phase == 1:
-                self._temp_phase = 2
-                _LOGGER.warning(
-                    "Strategie-Wechsel: Phase 1 ohne Fortschritt → Phase 2 "
-                    "(Kanal wird neu angefordert als letzter Fallback)"
-                )
-                self._assigned_channel = None
-                self._channel_ready.clear()
-                try:
-                    await asyncio.wait_for(self._channel_ready.wait(), timeout=15.0)
-                    _LOGGER.warning(
-                        "Kanal neu zugewiesen: 0x%02X", self._assigned_channel
-                    )
-                except asyncio.TimeoutError:
-                    _LOGGER.error("Kanal-Neuzuweisung fehlgeschlagen (Timeout)")
-                self._temp_phase = 1  # zurück zu Phase 1, aber mit frischem Kanal
-            # Phase 2 selbst eskaliert nicht weiter – nach einem
-            # Kanal-Reset läuft es als Phase 1 weiter; greift das
-            # ebenfalls nicht, beendet der bestehende max_att-Abbruch
-            # unten den Vorgang mit einer klaren Fehlermeldung.
-
-        # Pro 0,5° max ~12 Versuche, Gesamt abhängig von Distanz
-        steps_needed = max(1, int(round(abs(self._target_temp - current) / 0.5)))
-        max_att = steps_needed * 12 + 20
-        if self._command_attempts >= max_att:
+        if self._command_attempts > 64:
             _LOGGER.error(
-                "Temperatur abgebrochen | aktuell=%.1f Ziel=%.1f attempts=%d "
-                "half_steps=%d letzte_phase=%d",
-                current, self._target_temp, self._command_attempts,
-                getattr(self, "_temp_steps_done", 0), phase,
+                "Temp: >64 Versuche – Abbruch (HyperActiveJ-Limit)"
             )
             self._target_temp = NO_CHANGE_REQUESTED
             async with self._pending_lock:
@@ -1171,7 +935,59 @@ class SpaClient:
             self._temp_done.set()
             return
 
-        await self._send_temp_step(self._target_temp > current)
+        await self._wait_pending_clear(timeout=2.0)
+        _LOGGER.warning(
+            "Temp-Schritt %s CC btn=%d attempt=%d ch=0x%02X (HyperActiveJ-Stil)",
+            label, btn, self._command_attempts + 1,
+            self._assigned_channel or 0,
+        )
+        # Exakt wie send_CCmessage: mtype=CC_REQ, val=btn, b6=0
+        await self._queue_cc(btn, CC_REQ, 0)
+        self._last_temp_code = (CC_REQ, btn, 0)
+        self._last_temp_warmer = warmer
+        self._last_temp_cmd_ts = time.monotonic()
+        self._command_attempts += 1
+
+
+    async def _handle_temp_feedback(self, status: dict) -> None:
+        """Wie HyperActiveJ: bei jedem Status prüfen, ggf. TEMP_UP/DOWN senden."""
+        if self._target_temp == NO_CHANGE_REQUESTED:
+            return
+
+        # checkCounter wie Referenz
+        if self._temp_check > 0:
+            self._temp_check -= 1
+            return
+
+        current = float(status["set_temp"])
+        if abs(current - self._target_temp) < 0.3:
+            _LOGGER.warning(
+                "Soll-Temperatur erreicht: %.1f °C (Ziel %.1f) attempts=%d",
+                current, self._target_temp, self._command_attempts,
+            )
+            self._target_temp = NO_CHANGE_REQUESTED
+            self._temp_done.set()
+            return
+
+        if self._command_attempts > 64:
+            _LOGGER.error(
+                "set_temperature TIMEOUT | Ziel=%.1f got=%.1f attempts=%d",
+                self._target_temp, current, self._command_attempts,
+            )
+            self._target_temp = NO_CHANGE_REQUESTED
+            async with self._pending_lock:
+                self._pending.clear()
+            self._temp_done.set()
+            return
+
+        warmer = self._target_temp > current
+        _LOGGER.warning(
+            "Temp-STATUS set=%.1f ziel=%.1f → sende %s",
+            current, self._target_temp,
+            "TEMP_UP" if warmer else "TEMP_DOWN",
+        )
+        self._last_temp_seen = current
+        await self._send_temp_step(warmer)
         self._temp_check = CHECKS_BEFORE_RETRY
 
 
@@ -1350,14 +1166,14 @@ class SpaClient:
             await asyncio.sleep(0.8)
 
     async def set_temperature(self, target: float) -> None:
-        """Solltemperatur: erst Direct-Set 0x20, sonst nur sichere C6-Codes."""
+        """Solltemperatur per Klartext-CC wie HyperActiveJ (225/226)."""
         target = max(20.0, min(40.0, round(target * 2) / 2.0))
         async with self._cmd_lock:
             self._target_temp = NO_CHANGE_REQUESTED
             self._temp_done.set()
             async with self._pending_lock:
                 self._pending.clear()
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.2)
             self._temp_done.clear()
 
             snap = await self._status_snapshot()
@@ -1369,93 +1185,57 @@ class SpaClient:
             ch = await self._ensure_channel()
             self._cc_queued = 0
             self._cc_sent = 0
+            self._command_attempts = 0
+            self._temp_check = 0
+            self._temp_steps_done = 0
+            self._last_temp_seen = float(snap["set_temp"])
             self._debug_cmd = True
+            self._target_temp = target
+
             _LOGGER.warning(
-                "set_temperature START | Ziel=%.1f aktuell=%.1f kanal=0x%02X",
+                "set_temperature START | Ziel=%.1f aktuell=%.1f kanal=0x%02X "
+                "| Modus=HyperActiveJ CC 225/226",
                 target, snap["set_temp"], ch,
             )
+
+            # Menü verlassen falls nötig
             if snap.get("in_menu"):
                 await self._queue_cc(BTN_MENU)
                 await self._wait_pending_clear()
-            await self._ensure_pumps_off_for_heating()
-            await self._ensure_temp_range(target, snap["raw_d8"])
-            await self._wait_pending_clear()
 
-            # 1) Direct-Set versuchen (auf dieser Hardware bisher nie
-            # erfolgreich, aber praktisch kostenlos als Opportunist-Versuch;
-            # nur 1x statt 3x, um keine Zeit zu verschwenden).
-            for i in range(1):
-                await self._try_direct_set(target)
-                await asyncio.sleep(1.5)
-                check = await self._status_snapshot()
-                if check and abs(check["set_temp"] - target) < 0.3:
-                    _LOGGER.warning(
-                        "Direct-Set erfolgreich: %.1f °C (Versuch %d)",
-                        check["set_temp"], i + 1,
-                    )
-                    self._debug_cmd = False
-                    return
-                if check:
-                    _LOGGER.warning(
-                        "Direct-Set Versuch %d: got=%.1f (Ziel %.1f)",
-                        i + 1, check["set_temp"], target,
-                    )
+            # Ersten Schritt sofort anstoßen
+            warmer = target > snap["set_temp"]
+            await self._send_temp_step(warmer)
+            self._temp_check = CHECKS_BEFORE_RETRY
 
-            # 2) Button-Emulation nur mit sicheren Codes
-            snap = await self._status_snapshot() or snap
-            self._command_attempts = 0
-            self._temp_no_progress = 0
-            self._temp_steps_done = 0
-            self._temp_code_idx = 0
-            self._temp_fail_on_code = 0
-            self._temp_stall_rounds = 0
-            # Bekannt schlechte UP-Codes von vornherein sperren
-            # Nur Codes die Live als GEGEN-Richtung erwiesen sind
-            self._temp_blacklist_up = set()
-            self._temp_blacklist_down = set()
-            _LOGGER.warning(
-                "Learn-Pool: UP=%d DOWN=%d (aus Panel-Sniff)",
-                len(self._learned_c6_up), len(self._learned_c6_down),
-            )
-            self._last_temp_code = None
-            self._last_temp_seen = snap["set_temp"]
-            self._temp_start = snap["set_temp"]
-            self._target_temp = target
-            self._temp_check = 0
-            # Gestaffelte Fallback-Strategie (siehe _handle_temp_feedback):
-            #   Phase 0 = schnelles Nachfassen mit demselben Code (kurze
-            #             Pause), um das Zeitfenster vor einem möglichen
-            #             Zurückspringen des angezeigten Sollwerts zu treffen
-            #   Phase 1 = klassisches Alternieren zweier Codes mit langer
-            #             Pause (bisheriges Verhalten) als Fallback
-            #   Phase 2 = Kanal wird neu angefordert (letzter Fallback vor
-            #             endgültigem Abbruch mit klarer Fehlermeldung)
-            self._temp_phase = 0
-            self._temp_phase_baseline = snap["set_temp"]
-            self._temp_phase_attempts = 0
-
-            steps = abs(target - snap["set_temp"]) / 0.5
-            timeout = max(180.0, steps * 18.0 + 45.0)
-            await self._handle_temp_feedback(snap)
+            # Warten bis Feedback-Schleife fertig (Status-getrieben)
+            # Max ~64 Versuche * ~1s Status ≈ 90s
             try:
-                await asyncio.wait_for(self._temp_done.wait(), timeout=timeout)
-            except asyncio.TimeoutError as exc:
+                await asyncio.wait_for(self._temp_done.wait(), timeout=90.0)
+            except asyncio.TimeoutError:
                 final = await self._status_snapshot()
-                got = final["set_temp"] if final else None
+                got = final["set_temp"] if final else -1
                 _LOGGER.error(
-                    "set_temperature TIMEOUT | Ziel=%.1f got=%s "
-                    "sent=%d attempts=%d steps_ok=%d",
+                    "set_temperature TIMEOUT | Ziel=%.1f got=%.1f sent=%d attempts=%d",
                     target, got, self._cc_sent, self._command_attempts,
-                    getattr(self, "_temp_steps_done", 0),
                 )
-                raise UpdateFailed(
-                    f"Soll {target:.1f} °C nicht erreicht (aktuell {got})"
-                ) from exc
-            finally:
                 self._target_temp = NO_CHANGE_REQUESTED
-                self._debug_cmd = False
                 async with self._pending_lock:
                     self._pending.clear()
+                raise UpdateFailed(
+                    f"Solltemperatur nicht erreicht (ist {got}, Ziel {target})"
+                )
+            finally:
+                self._debug_cmd = False
+
+            final = await self._status_snapshot()
+            _LOGGER.warning(
+                "set_temperature OK | Ziel=%.1f final=%.1f attempts=%d sent=%d",
+                target,
+                final["set_temp"] if final else -1,
+                self._command_attempts,
+                self._cc_sent,
+            )
 
 
     async def set_light(
