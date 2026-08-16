@@ -147,6 +147,92 @@ def _calc_cs(data: bytes | bytearray, length: int) -> int:
     return (crc ^ 0x02) & 0xFF
 
 
+
+
+def _jacuzzi_xor_cipher(packet: bytearray, encrypt: bool = True) -> bytearray:
+    """Jacuzzi/Sundance XOR-Cipher (dhmsjs/jacuzzi_decrypt).
+
+    Symmetric – encrypt und decrypt sind identisch.
+    Unterstützt C4/CA/CC. Für C6 experimentell key1=packet[5]^0xC6.
+    """
+    if len(packet) < 7:
+        return packet
+    packet = bytearray(packet)
+    packet_type = packet[4]
+    if packet_type == 0xC4:
+        key1 = packet[5] ^ 0x19
+    elif packet_type == 0xCA:
+        key1 = packet[5] ^ 0x59
+    elif packet_type == 0xCC:
+        key1 = packet[5] ^ 0xDF
+    elif packet_type == 0xC6:
+        key1 = packet[5] ^ 0xC6  # experimentell
+    else:
+        return packet
+
+    HEADER_LENGTH = 5
+    packet_length = packet[1]
+    key2 = packet_length - HEADER_LENGTH - 2
+    for i in range(6, packet_length):
+        key2 = (key2 - 1) % 64
+        packet[i] = packet[i] ^ key1 ^ key2
+
+    if not encrypt:
+        # Nach Decrypt: Extra-Key-Byte auf 0 setzen
+        packet[5] = 0
+        packet[-2] = _calc_cs(packet[1:packet_length], packet_length - 1)
+    else:
+        # Nach Encrypt: Checksum neu
+        packet[-2] = _calc_cs(packet[1:packet_length], packet_length - 1)
+    return packet
+
+
+def _build_cc_encrypted(
+    btn: int,
+    channel: int = CMD_CHANNEL,
+    mtype: int = CC_REQ,
+    b6: int = 0,
+    key_byte: int = 0,
+) -> bytes:
+    """Verschlüsseltes CC (Länge 8, Extra-Key-Byte) für Cameo/encrypted Boards."""
+    ml = 8
+    msg = bytearray(10)
+    msg[0] = M_STARTEND
+    msg[1] = ml
+    msg[2] = channel & 0xFF
+    msg[3] = 0xBF
+    msg[4] = mtype
+    msg[5] = key_byte & 0xFF
+    msg[6] = btn & 0xFF
+    msg[7] = b6 & 0xFF
+    msg[8] = 0  # CS placeholder
+    msg[9] = M_STARTEND
+    msg = _jacuzzi_xor_cipher(msg, encrypt=True)
+    return bytes(msg)
+
+
+def _build_c6_encrypted(
+    btn: int,
+    b6: int,
+    channel: int = CMD_CHANNEL,
+    key_byte: int = 0,
+) -> bytes:
+    """C6 mit optionalem Jacuzzi-Cipher (experimentell)."""
+    ml = 8
+    msg = bytearray(10)
+    msg[0] = M_STARTEND
+    msg[1] = ml
+    msg[2] = channel & 0xFF
+    msg[3] = 0xBF
+    msg[4] = 0xC6
+    msg[5] = key_byte & 0xFF
+    msg[6] = btn & 0xFF
+    msg[7] = b6 & 0xFF
+    msg[8] = 0
+    msg[9] = M_STARTEND
+    msg = _jacuzzi_xor_cipher(msg, encrypt=True)
+    return bytes(msg)
+
 def _xormsg(data: bytes | bytearray) -> list[int]:
     result = []
     for i in range(0, len(data) - 1, 2):
@@ -419,6 +505,7 @@ class SpaClient:
         self._last_set_temp_seen: float | None = None
         self._temp_locked_code = None
         self._c6_score: dict = {}
+        self._temp_send_mode = 0
         self._sniff_panel_cc = True
         self._last_logged_display: int | None = None
         self._last_logged_set: float | None = None
@@ -646,12 +733,25 @@ class SpaClient:
                     raw_hex = msg.hex(" ")
                     recent = getattr(self, "_recent_tx", set())
                     if raw_hex not in recent:
-                        btn, b6 = msg[5], msg[6]
-                        _LOGGER.warning(
-                            "PANEL-SNIFF C6 | ch=0x%02X btn=0x%02X b6=0x%02X "
-                            "xor=0x%02X raw=%s",
-                            channel, btn, b6, btn ^ b6, raw_hex,
-                        )
+                        # Roh-Bytes
+                        if len(msg) >= 9 and msg[1] >= 8:
+                            # ggf. encrypted (extra key byte)
+                            dec = _jacuzzi_xor_cipher(bytearray(msg), encrypt=False)
+                            _LOGGER.warning(
+                                "PANEL-SNIFF C6-ENC | raw=%s decrypted=%s "
+                                "btn=0x%02X b6=0x%02X",
+                                raw_hex, bytes(dec).hex(" "),
+                                dec[6] if len(dec) > 6 else 0,
+                                dec[7] if len(dec) > 7 else 0,
+                            )
+                            btn, b6 = msg[6], msg[7] if len(msg) > 7 else 0
+                        else:
+                            btn, b6 = msg[5], msg[6] if len(msg) > 6 else 0
+                            _LOGGER.warning(
+                                "PANEL-SNIFF C6 | ch=0x%02X btn=0x%02X b6=0x%02X "
+                                "xor=0x%02X sum=0x%02X raw=%s",
+                                channel, btn, b6, btn ^ b6, (btn + b6) & 0xFF, raw_hex,
+                            )
                         self._panel_c6_recent.append((time.monotonic(), btn, b6))
                         if len(self._panel_c6_recent) > 80:
                             self._panel_c6_recent = self._panel_c6_recent[-60:]
@@ -919,34 +1019,73 @@ class SpaClient:
             )
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """HyperActiveJ-kompatibel: nur Klartext CC TEMP_UP=225 / TEMP_DOWN=226."""
-        btn = BTN_TEMP_UP if warmer else BTN_TEMP_DOWN
-        label = "TEMP_UP" if warmer else "TEMP_DOWN"
+        """Temp: 1) gelernte C6  2) verschlüsseltes CC 225/226  3) C6 F0/EC."""
         if self._assigned_channel is None:
             self._assigned_channel = CMD_CHANNEL
+        ch = self._assigned_channel
 
-        if self._command_attempts > 64:
-            _LOGGER.error(
-                "Temp: >64 Versuche – Abbruch (HyperActiveJ-Limit)"
-            )
+        if self._command_attempts > 80:
+            _LOGGER.error("Temp: >80 Versuche – Abbruch")
             self._target_temp = NO_CHANGE_REQUESTED
             async with self._pending_lock:
                 self._pending.clear()
             self._temp_done.set()
             return
 
-        await self._wait_pending_clear(timeout=2.0)
-        _LOGGER.warning(
-            "Temp-Schritt %s CC btn=%d attempt=%d ch=0x%02X (HyperActiveJ-Stil)",
-            label, btn, self._command_attempts + 1,
-            self._assigned_channel or 0,
-        )
-        # Exakt wie send_CCmessage: mtype=CC_REQ, val=btn, b6=0
-        await self._queue_cc(btn, CC_REQ, 0)
-        self._last_temp_code = (CC_REQ, btn, 0)
+        await self._wait_pending_clear(timeout=3.0)
+        mode = getattr(self, "_temp_send_mode", 0)  # 0=C6 learn, 1=enc CC, 2=C6 fixed
+
+        if warmer:
+            learned = list(self._learned_c6_up)
+            fixed_c6 = [(0xF0, 0x47), (0x52, 0xE7)]
+            btn_plain = BTN_TEMP_UP
+            label = "TEMP_UP"
+        else:
+            learned = list(self._learned_c6_down)
+            fixed_c6 = [(0xEC, 0x59), (0xC8, 0x7C)]
+            btn_plain = BTN_TEMP_DOWN
+            label = "TEMP_DOWN"
+
+        idx = self._command_attempts
+
+        if mode == 0 and learned:
+            # Frische gelernte C6 (ohne Extra-Key, wie Panel sendet)
+            i = idx % len(learned)
+            mtype, btn, b6 = learned[i]
+            pkt = _build_cc(btn, ch, mtype, b6)  # length 7, raw C6/CC
+            _LOGGER.warning(
+                "Temp-Schritt %s LEARNED C6/CC btn=0x%02X b6=0x%02X attempt=%d",
+                label, btn, b6, idx + 1,
+            )
+            await self._queue_raw(pkt)
+        elif mode == 1 or (mode == 0 and not learned and idx >= 4):
+            # Verschlüsseltes Klartext-CC (jacuzzi_decrypt)
+            self._temp_send_mode = 1
+            pkt = _build_cc_encrypted(btn_plain, ch, CC_REQ, 0, key_byte=0)
+            _LOGGER.warning(
+                "Temp-Schritt %s ENC-CC btn=%d pkt=%s attempt=%d",
+                label, btn_plain, pkt.hex(" "), idx + 1,
+            )
+            await self._queue_raw(pkt)
+        else:
+            # Feste C6-Paare (Panel-ähnlich, length 7)
+            self._temp_send_mode = 2
+            btn, b6 = fixed_c6[idx % len(fixed_c6)]
+            pkt = _build_cc(btn, ch, 0xC6, b6)
+            _LOGGER.warning(
+                "Temp-Schritt %s FIXED-C6 btn=0x%02X b6=0x%02X attempt=%d",
+                label, btn, b6, idx + 1,
+            )
+            await self._queue_raw(pkt)
+
+        self._last_temp_code = (label, mode)
         self._last_temp_warmer = warmer
         self._last_temp_cmd_ts = time.monotonic()
         self._command_attempts += 1
+        # Alle 8 Versuche Modus wechseln
+        if self._command_attempts % 8 == 0:
+            self._temp_send_mode = (getattr(self, "_temp_send_mode", 0) + 1) % 3
+            _LOGGER.warning("Temp-Modus wechsel → %d", self._temp_send_mode)
 
 
     async def _handle_temp_feedback(self, status: dict) -> None:
@@ -1188,13 +1327,14 @@ class SpaClient:
             self._command_attempts = 0
             self._temp_check = 0
             self._temp_steps_done = 0
+            self._temp_send_mode = 0
             self._last_temp_seen = float(snap["set_temp"])
             self._debug_cmd = True
             self._target_temp = target
 
             _LOGGER.warning(
                 "set_temperature START | Ziel=%.1f aktuell=%.1f kanal=0x%02X "
-                "| Modus=HyperActiveJ CC 225/226",
+                "| Modus=C6-Learn + ENC-CC + FIXED-C6",
                 target, snap["set_temp"], ch,
             )
 
