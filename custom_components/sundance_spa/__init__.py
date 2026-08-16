@@ -1321,13 +1321,48 @@ class SpaClient:
 
         prev = self._last_temp_seen
         delta = current - prev
+        code = getattr(self, "_last_temp_code", None)
+        if not hasattr(self, "_c6_score"):
+            self._c6_score = {}
+
+        # ── Range/Unit-Sprung-Filter ─────────────────────────────────────
+        # Cameo 880 kodiert raw_d8 unterschiedlich je nach Bereich (<80 = °C×2,
+        # >=80 = °F). Ein Sprung von z.B. 39.0→29.0 ist praktisch nie eine
+        # echte physikalische Änderung durch einen einzigen C6-Befehl, sondern
+        # ein Wechsel der Kodierungs-Skala (bzw. Decode-Rauschen). Genau diese
+        # Sprünge waren es, die den Score-/Blacklist-Mechanismus verwirrt und
+        # die großen Schwankungen verursacht haben (siehe LEARN-Filter unten,
+        # der für dieselbe Situation schon existierte, aber hier fehlte).
+        if abs(delta) >= TEMP_RANGE_JUMP_C:
+            _LOGGER.warning(
+                "Temp-Feedback: großer Sprung ignoriert (Range/Unit-Artefakt, "
+                "keine Wertung) %.1f → %.1f Δ=%.1f code=%s",
+                prev, current, delta, code,
+            )
+            self._last_temp_seen = current
+            self._temp_stall_rounds = getattr(self, "_temp_stall_rounds", 0) + 1
+            if abs(current - self._target_temp) < 0.3:
+                self._target_temp = NO_CHANGE_REQUESTED
+                self._temp_done.set()
+                return
+            if self._command_attempts >= TEMP_MAX_ATTEMPTS:
+                _LOGGER.error(
+                    "set_temperature TIMEOUT | Ziel=%.1f got=%.1f attempts=%d",
+                    self._target_temp, current, self._command_attempts,
+                )
+                self._target_temp = NO_CHANGE_REQUESTED
+                async with self._pending_lock:
+                    self._pending.clear()
+                self._temp_done.set()
+                return
+            self._temp_check = TEMP_STATUS_WAIT
+            await self._send_temp_step(self._target_temp > current)
+            return
+
         err_prev = abs(self._target_temp - prev)
         err_now = abs(self._target_temp - current)
         moved = abs(delta) >= 0.25
-        code = getattr(self, "_last_temp_code", None)
         warmer_needed = self._target_temp > current
-        if not hasattr(self, "_c6_score"):
-            self._c6_score = {}
 
         is_c6 = (
             isinstance(code, tuple)
