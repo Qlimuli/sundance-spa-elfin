@@ -1484,13 +1484,19 @@ class SpaClient:
 
 
     async def _send_light_step(self, color: bool = False) -> None:
-        """Licht Cameo: C7 0x2F/0x33 (Panel-Sniff, byte-identisch).
+        """Licht-Schritt einreihen (nicht blockieren).
 
-        WICHTIG: Diese Methode darf den Receiver NICHT blockieren.
-        Nur einreihen – CTS-Flush läuft im Receiver. Kein wait_pending hier!
+        C7 vom Panel funktioniert, von uns trotz CTS nicht.
+        Deshalb mehrere Varianten testen:
+          0-3:   C7 encrypted (Panel-Format)
+          4-6:   CC Klartext 0x2F/0x33
+          7-9:   CC Klartext 241 (Balboa Standard)
+          10-12: encrypted CC 0x2F/0x33
         """
-        if self._light_attempt >= 12:
-            _LOGGER.error("Licht-Versuche erschöpft – Abbruch")
+        if self._light_attempt >= 14:
+            if not getattr(self, "_light_exhausted_logged", False):
+                _LOGGER.error("Licht-Versuche erschöpft – Abbruch")
+                self._light_exhausted_logged = True
             self._target_light_brightness = LIGHT_NO_CHANGE
             self._target_light_mode = LIGHT_NO_CHANGE
             async with self._pending_lock:
@@ -1498,59 +1504,56 @@ class SpaClient:
             self._light_done.set()
             return
 
-        # Nicht einreihen wenn schon etwas pending – CTS muss erst flushen
         async with self._pending_lock:
             if self._pending:
-                _LOGGER.debug(
-                    "Licht-Schritt übersprungen – Pending noch voll (%d)",
-                    len(self._pending),
-                )
                 return
 
         self._assigned_channel = CMD_CHANNEL
         attempt = self._light_attempt
+        ch = CMD_CHANNEL
 
         if color:
-            _LOGGER.warning(
-                "Licht-Befehl COLOR mtype=0xCC btn=0xF2 attempt=%d ch=0x10",
-                attempt + 1,
-            )
+            _LOGGER.warning("Licht COLOR CC-F2 attempt=%d", attempt + 1)
             await self._queue_cc(0xF2, CC_REQ, 0x00)
-        else:
-            # Nur encrypted C7 – Panel-Format, byte-identisch verifiziert
+        elif attempt < 4:
             key_byte = ((attempt + 1) * 0x17 + 0x04) & 0xFF
-            pkt = _build_c7(
-                LIGHT_C7_BTN, LIGHT_C7_B6, CMD_CHANNEL, key_byte=key_byte
-            )
+            pkt = _build_c7(LIGHT_C7_BTN, LIGHT_C7_B6, ch, key_byte=key_byte)
             _LOGGER.warning(
-                "Licht-Befehl C7 btn=0x%02X b6=0x%02X key=0x%02X "
-                "attempt=%d pkt=%s",
-                LIGHT_C7_BTN, LIGHT_C7_B6, key_byte, attempt + 1, pkt.hex(" "),
+                "Licht C7-ENC key=0x%02X attempt=%d pkt=%s",
+                key_byte, attempt + 1, pkt.hex(" "),
             )
             await self._queue_raw(pkt)
+        elif attempt < 7:
+            _LOGGER.warning("Licht CC-2F33 attempt=%d", attempt + 1)
+            await self._queue_cc(LIGHT_C7_BTN, CC_REQ, LIGHT_C7_B6)
+        elif attempt < 10:
+            _LOGGER.warning("Licht CC-241 attempt=%d", attempt + 1)
+            await self._queue_cc(BTN_LIGHT, CC_REQ, 0)
+        else:
+            key_byte = ((attempt + 1) * 0x13) & 0xFF
+            pkt = _build_cc_encrypted(
+                LIGHT_C7_BTN, ch, CC_REQ, LIGHT_C7_B6, key_byte=key_byte
+            )
+            _LOGGER.warning(
+                "Licht CC-ENC 2F/33 key=0x%02X attempt=%d pkt=%s",
+                key_byte, attempt + 1, pkt.hex(" "),
+            )
+            await self._queue_raw(pkt)
+
         self._light_attempt += 1
 
     async def _handle_light_feedback(self, lights: dict) -> None:
-        if self._light_check > 0:
-            self._light_check -= 1
-        if self._light_check > 0:
-            return
-
+        """Nur Erfolg erkennen – Senden macht die set_light-Schleife (nicht Receiver)."""
         if self._target_light_mode != LIGHT_NO_CHANGE:
-            if lights["mode_raw"] == self._target_light_mode:
+            if lights.get("mode_raw") == self._target_light_mode:
                 _LOGGER.warning(
                     "Licht-Modus erreicht: %s (raw=%s)",
                     lights.get("mode"),
                     lights["mode_raw"],
                 )
                 self._target_light_mode = LIGHT_NO_CHANGE
-                self._light_done.set()
-            elif lights["brightness_raw"] == 0:
-                await self._send_light_step(color=False)
-                self._light_check = 3  # CA-Zyklen warten (Receiver darf nicht blockieren)
-            else:
-                await self._send_light_step(color=True)
-                self._light_check = 3
+                if self._target_light_brightness == LIGHT_NO_CHANGE:
+                    self._light_done.set()
             return
 
         if self._target_light_brightness == LIGHT_NO_CHANGE:
@@ -1565,16 +1568,6 @@ class SpaClient:
             )
             self._target_light_brightness = LIGHT_NO_CHANGE
             self._light_done.set()
-            return
-
-        # Panel: jeder C7-Druck = +20% (0→20→40→…→100→0). Gleicher Button.
-        # Nur einreihen – kein wait hier (wird aus Receiver aufgerufen!)
-        _LOGGER.warning(
-            "Licht noch nicht am Ziel (aktuell=%s ziel=%s attempts=%s) → C7 einreihen",
-            cur, tgt, self._light_attempt,
-        )
-        await self._send_light_step(color=False)
-        self._light_check = 3
 
     async def send_button(self, btn: int, mtype: int = CC_REQ, b6: int = 0) -> None:
         await self._queue_cc(btn, mtype, b6)
@@ -1775,6 +1768,7 @@ class SpaClient:
             self._cc_queued = 0
             self._cc_sent = 0
             self._light_attempt = 0
+            self._light_exhausted_logged = False
             self._light_done.clear()
             self._light_check = 0
             self._target_light_mode = LIGHT_NO_CHANGE
