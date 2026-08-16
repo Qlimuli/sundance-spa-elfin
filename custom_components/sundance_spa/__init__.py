@@ -346,6 +346,9 @@ TEMP_FLOOR_PROBE = 4
 TEMP_STATUS_WAIT = 5              # Status-Frames warten nach TX (~1–1.5s)
 TEMP_MIN_STEP_GAP = 0.9           # min. Sekunden zwischen Temp-Befehlen
 TEMP_SPA_FLOOR_C = 28.0           # typisches Cameo-Minimum (High-Range)
+TEMP_CLEAN_STEP_MAX = 0.6         # nur ±0.5-Schritte dürfen STRONG-LOCK auslösen
+TEMP_JUMP_UNLOCK = 1.2            # bei Δ≥1.2°C Lock sofort lösen (kein echter Schritt)
+TEMP_OSCILLATION_LIMIT = 3        # Range-Sprünge hintereinander → aggressiv entsperren
 
 # Temperaturabhängige C6-Lernbereiche. Der Pool ist absichtlich nicht global:
 # Codes aus dem 28-32°C-Bereich sollen bei 36-39°C nicht mehr bevorzugt werden.
@@ -602,6 +605,8 @@ class SpaClient:
         self._temp_send_mode = 0  # 0=C6, 1=Klartext-CC, 2=Direct-Set 0x20
         self._temp_stall_rounds = 0
         self._temp_progress_at = 0
+        self._temp_jump_streak = 0  # aufeinanderfolgende Range/Unit-Sprünge
+        self._temp_stable_anchor: float | None = None  # letzter „sauberer“ Sollwert
         self._sniff_panel_cc = True
         self._last_logged_display: int | None = None
         self._last_logged_set: float | None = None
@@ -1581,43 +1586,79 @@ class SpaClient:
             self._c6_score = {}
 
         # ── Range/Unit-Sprung-Filter ─────────────────────────────────────
-        # Cameo 880 kodiert raw_d8 unterschiedlich je nach Bereich (<80 = °C×2,
-        # >=80 = °F). Ein Sprung von z.B. 39.0→29.0 ist praktisch nie eine
-        # echte physikalische Änderung durch einen einzigen C6-Befehl, sondern
-        # ein Wechsel der Kodierungs-Skala (bzw. Decode-Rauschen). Genau diese
-        # Sprünge waren es, die den Score-/Blacklist-Mechanismus verwirrt und
-        # die großen Schwankungen verursacht haben (siehe LEARN-Filter unten,
-        # der für dieselbe Situation schon existierte, aber hier fehlte).
+        # Cameo 880: große Sprünge (33.5↔39.5) sind Decode-/Range-Artefakte.
+        # Logs 2026-08-16: Climb bis ~33 funktioniert, darüber Oszillation.
         if abs(delta) >= TEMP_RANGE_JUMP_C:
+            self._temp_jump_streak = getattr(self, "_temp_jump_streak", 0) + 1
+            self._temp_stall_rounds = getattr(self, "_temp_stall_rounds", 0) + 1
+            # Lock sofort lösen – der Code hat den Sprung ausgelöst/verstärkt
+            if (
+                isinstance(code, tuple)
+                and len(code) == 3
+                and code[0] == 0xC6
+            ):
+                self._temp_locked_code = None
+                self._c6_score[code] = self._c6_score.get(code, 0) - 3
+                # Nicht in den Pool des Artefakt-Werts schreiben
             _LOGGER.warning(
                 "Temp-Feedback: großer Sprung ignoriert (Range/Unit-Artefakt, "
-                "keine Wertung) %.1f → %.1f Δ=%.1f code=%s",
-                prev, current, delta, code,
+                "keine Wertung) %.1f → %.1f Δ=%.1f code=%s streak=%d",
+                prev, current, delta, code, self._temp_jump_streak,
             )
-            self._last_temp_seen = current
-            self._temp_stall_rounds = getattr(self, "_temp_stall_rounds", 0) + 1
-            if abs(current - self._target_temp) < 0.3:
+            # Wenn der Sprung vom Ziel WEG führt: Anker behalten, Reading verwerfen
+            anchor = self._temp_stable_anchor
+            if anchor is None:
+                anchor = prev
+            err_cur = abs(current - self._target_temp)
+            err_anchor = abs(anchor - self._target_temp)
+            if err_cur > err_anchor + 0.4:
+                # Artefakt weiter weg vom Ziel → last_seen nicht auf Artefakt setzen
+                self._last_temp_seen = anchor
+                guide = anchor
+            else:
+                self._last_temp_seen = current
+                guide = current
+            if abs(guide - self._target_temp) < 0.3:
                 self._target_temp = NO_CHANGE_REQUESTED
                 self._temp_done.set()
                 return
             if self._command_attempts >= self._adaptive_temp_attempts():
                 _LOGGER.error(
                     "set_temperature TIMEOUT | Ziel=%.1f got=%.1f attempts=%d",
-                    self._target_temp, current, self._command_attempts,
+                    self._target_temp, guide, self._command_attempts,
                 )
                 self._target_temp = NO_CHANGE_REQUESTED
                 async with self._pending_lock:
                     self._pending.clear()
                 self._temp_done.set()
                 return
+            # Nach mehreren Oszillationen: Blacklist des letzten Codes im Anker-Bucket
+            if (
+                self._temp_jump_streak >= TEMP_OSCILLATION_LIMIT
+                and isinstance(code, tuple)
+                and len(code) == 3
+                and code[0] == 0xC6
+            ):
+                wanted_up = self._target_temp > guide
+                self._remove_c6_from_bucket(wanted_up, code, anchor)
+                self._temp_jump_streak = 0
+                _LOGGER.warning(
+                    "Temp-Oszillation: code=%s aus Bucket %s entfernt",
+                    code, self._bucket_label(self._temp_bucket(anchor)),
+                )
             self._temp_check = TEMP_STATUS_WAIT
-            await self._send_temp_step(self._target_temp > current)
+            await self._send_temp_step(self._target_temp > guide)
             return
+
+        # Sauberer Feedback-Pfad
+        self._temp_jump_streak = 0
+        self._temp_stable_anchor = current
 
         err_prev = abs(self._target_temp - prev)
         err_now = abs(self._target_temp - current)
         moved = abs(delta) >= 0.25
         warmer_needed = self._target_temp > current
+        clean_step = abs(delta) <= TEMP_CLEAN_STEP_MAX + 0.01
 
         is_c6 = (
             isinstance(code, tuple)
@@ -1627,15 +1668,19 @@ class SpaClient:
         )
 
         if moved and err_now < err_prev - 0.15:
-            # Erfolg → nur C6 locken
+            # Erfolg in Richtung Ziel
             self._temp_stall_rounds = 0
             self._temp_fail_on_code = 0
             if is_c6:
-                self._c6_score[code] = self._c6_score.get(code, 0) + 5
                 step_bucket = self._temp_bucket(prev)
                 direction = delta > 0
-                self._remove_c6_from_buckets(code)
-                self._add_c6_to_bucket(direction, code, prev, 5)
+                # Nur echte ±0.5-Schritte stark belohnen (Logs: 32→33.5 war zu groß)
+                score_add = 5 if clean_step else 1
+                self._c6_score[code] = self._c6_score.get(code, 0) + score_add
+                # In aktuellen Bucket legen + in Richtung nächster Bucket propagieren
+                self._add_c6_to_bucket(direction, code, prev, score_add)
+                next_temp = current if clean_step else (prev + (0.5 if direction else -0.5))
+                self._add_c6_to_bucket(direction, code, next_temp, max(1, score_add // 2))
                 if direction:
                     if code not in self._learned_c6_up:
                         self._learned_c6_up.append(code)
@@ -1648,18 +1693,31 @@ class SpaClient:
                     self._learned_c6_up = [c for c in self._learned_c6_up if c != code]
                     self._temp_blacklist_up.discard(code)
                     self._temp_blacklist_down.discard(code)
-                if self._c6_score[code] >= TEMP_STRONG_LOCK_SCORE:
+                # STRONG-LOCK nur bei sauberem 0.5-Schritt
+                if (
+                    clean_step
+                    and self._c6_score[code] >= TEMP_STRONG_LOCK_SCORE
+                ):
                     self._temp_locked_code = code
                     _LOGGER.warning(
-                        "Temp-C6 STRONG-LOCK code=%s bucket=%s score=%d",
-                        code, self._bucket_label(step_bucket), self._c6_score[code],
+                        "Temp-C6 STRONG-LOCK code=%s bucket=%s score=%d Δ=%.1f",
+                        code, self._bucket_label(step_bucket),
+                        self._c6_score[code], delta,
                     )
+                elif abs(delta) >= TEMP_JUMP_UNLOCK:
+                    # Großer Fortschritt ohne Clean-Step → kein Lock behalten
+                    if self._temp_locked_code == code:
+                        self._temp_locked_code = None
+                        _LOGGER.warning(
+                            "Temp-Lock verweigert (Δ=%.1f zu groß für 1 Schritt): %s",
+                            delta, code,
+                        )
             self._temp_steps_done = getattr(self, "_temp_steps_done", 0) + 1
             _LOGGER.warning(
                 "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code=%s score=%s%s | Pause",
                 prev, current, self._target_temp, code,
                 self._c6_score.get(code, 0) if is_c6 else "-",
-                " LOCK" if is_c6 else "",
+                " LOCK" if (is_c6 and self._temp_locked_code == code) else "",
             )
             self._last_temp_seen = current
             self._temp_check = TEMP_STATUS_WAIT
@@ -1988,23 +2046,47 @@ class SpaClient:
             self._temp_code_idx = 0
             self._temp_fail_on_code = 0
             self._temp_exploration_round = 0
+            self._temp_jump_streak = 0
             self._temp_target_bucket = self._temp_bucket(target)
+            self._temp_current_bucket = self._temp_bucket(float(snap["set_temp"]))
+            self._temp_stable_anchor = float(snap["set_temp"])
             # Lock behalten wenn Richtung passt, sonst neu lernen
             locked = getattr(self, "_temp_locked_code", None)
             warmer = target > snap["set_temp"]
             if locked and locked in self._temp_blacklist(warmer):
                 self._temp_locked_code = None
+            # Alte per-Bucket-Blacklist für den Start-Bucket leicht lockern
+            # (Codes können nach Session-Wechsel wieder taugen)
+            start_b = self._temp_current_bucket
+            stale = [
+                k for k in self._c6_bucket_blacklist
+                if k[1] == start_b and k[0] == (1 if warmer else 0)
+            ]
+            for k in stale[:4]:
+                self._c6_bucket_blacklist.discard(k)
+            # Beim Hochlaufen: bewährte Low-Range-UP-Codes in current+next legen
+            if warmer and float(snap["set_temp"]) < 33.5:
+                for entry in list(self._learned_c6_up)[-6:]:
+                    self._add_c6_to_bucket(True, entry, float(snap["set_temp"]), 0)
+                    self._add_c6_to_bucket(True, entry, min(target, float(snap["set_temp"]) + 2.0), 0)
             self._last_temp_seen = float(snap["set_temp"])
             self._debug_cmd = True
             self._target_temp = target
 
+            cur_pool = len(
+                self._c6_buckets["up" if warmer else "down"].get(
+                    self._temp_current_bucket, []
+                )
+            )
             _LOGGER.warning(
                 "set_temperature START | Ziel=%.1f aktuell=%.1f kanal=0x%02X "
                 "| Modus=C6-Bucket/Learn→CC→0x20 pool_up=%d pool_down=%d "
-                "target_bucket=%s max_attempts=%d lock=%s",
+                "cur_bucket=%s tgt_bucket=%s cur_pool=%d max_attempts=%d lock=%s",
                 target, snap["set_temp"], ch,
                 len(self._learned_c6_up), len(self._learned_c6_down),
+                self._bucket_label(self._temp_current_bucket),
                 self._bucket_label(self._temp_target_bucket),
+                cur_pool,
                 self._adaptive_temp_attempts(target),
                 self._temp_locked_code,
             )
