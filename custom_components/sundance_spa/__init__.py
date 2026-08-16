@@ -607,6 +607,7 @@ class SpaClient:
         self._temp_progress_at = 0
         self._temp_jump_streak = 0  # aufeinanderfolgende Range/Unit-Sprünge
         self._temp_stable_anchor: float | None = None  # letzter „sauberer“ Sollwert
+        self._temp_range_forced = False  # High-Range in diesem set_temperature schon gesendet
         self._sniff_panel_cc = True
         self._last_logged_display: int | None = None
         self._last_logged_set: float | None = None
@@ -1632,20 +1633,33 @@ class SpaClient:
                     self._pending.clear()
                 self._temp_done.set()
                 return
-            # Nach mehreren Oszillationen: Blacklist des letzten Codes im Anker-Bucket
-            if (
-                self._temp_jump_streak >= TEMP_OSCILLATION_LIMIT
-                and isinstance(code, tuple)
-                and len(code) == 3
-                and code[0] == 0xC6
-            ):
-                wanted_up = self._target_temp > guide
-                self._remove_c6_from_bucket(wanted_up, code, anchor)
+            # Nach mehreren Oszillationen: erst Range-HI versuchen (34↔28.5-Muster),
+            # dann Code aus Anker-Bucket entfernen.
+            if self._temp_jump_streak >= TEMP_OSCILLATION_LIMIT:
+                if (
+                    self._target_temp >= 33.5
+                    and not getattr(self, "_temp_range_forced", False)
+                ):
+                    _LOGGER.warning(
+                        "Temp-Oszillation streak=%d bei Ziel=%.1f → High-Range erzwingen",
+                        self._temp_jump_streak, self._target_temp,
+                    )
+                    await self._force_temp_range_high()
+                    self._temp_check = TEMP_STATUS_WAIT
+                    await self._send_temp_step(self._target_temp > guide)
+                    return
+                if (
+                    isinstance(code, tuple)
+                    and len(code) == 3
+                    and code[0] == 0xC6
+                ):
+                    wanted_up = self._target_temp > guide
+                    self._remove_c6_from_bucket(wanted_up, code, anchor)
+                    _LOGGER.warning(
+                        "Temp-Oszillation: code=%s aus Bucket %s entfernt",
+                        code, self._bucket_label(self._temp_bucket(anchor)),
+                    )
                 self._temp_jump_streak = 0
-                _LOGGER.warning(
-                    "Temp-Oszillation: code=%s aus Bucket %s entfernt",
-                    code, self._bucket_label(self._temp_bucket(anchor)),
-                )
             self._temp_check = TEMP_STATUS_WAIT
             await self._send_temp_step(self._target_temp > guide)
             return
@@ -1983,23 +1997,41 @@ class SpaClient:
         self._assigned_channel = CMD_CHANNEL
         return CMD_CHANNEL
 
-    async def _ensure_temp_range(self, target: float, current_raw: int) -> None:
-        """Cameo 880: Temperaturbereich (Low/High) vor Feineinstellung umschalten."""
-        high_range = current_raw >= 80
-        want_high = target >= 37.0
-        if high_range != want_high:
-            if want_high:
-                await self._queue_cc(BTN_TEMP_RANGE_HI)
-            else:
-                await self._queue_cc(BTN_TEMP_RANGE_LOW)
-            _LOGGER.info(
-                "Temperaturbereich umschalten: %s (raw_d8=%s, target=%.1f)",
-                "HIGH" if want_high else "LOW",
-                current_raw,
-                target,
-            )
-            await self._wait_pending_clear()
-            self._temp_check = CHECKS_BEFORE_RETRY
+    async def _force_temp_range_high(self) -> None:
+        """High-Range erzwingen – Logs: über ~33–34°C sonst 34↔28.5-Oszillation.
+
+        Cameo speichert Low- und High-Range-Soll getrennt. Ohne High-Range
+        enden UP-Schritte an der Low-Range-Grenze und springen auf den
+        Low-Sollwert (~28.5) zurück. Deshalb vor Zielen ≥33.5 und bei
+        erkannter Oszillation explizit RANGE HI senden.
+        """
+        _LOGGER.warning(
+            "Temp-Range → HIGH (CC %d / alt %d) – Ziel über Low-Range-Grenze",
+            BTN_TEMP_RANGE_HI, TEMP_RANGE_HI_CC_BTN,
+        )
+        # Zwei Varianten: klassischer Button + Cameo-CC-Variante aus dem Code
+        await self._queue_cc(BTN_TEMP_RANGE_HI)
+        await self._wait_pending_clear(timeout=2.0)
+        await asyncio.sleep(0.4)
+        await self._queue_cc(TEMP_RANGE_HI_CC_BTN, CC_REQ, TEMP_RANGE_HI_CC_B6)
+        await self._wait_pending_clear(timeout=2.0)
+        await asyncio.sleep(0.6)
+        self._temp_jump_streak = 0
+        self._temp_range_forced = True
+
+    async def _ensure_temp_range(self, target: float, snap: dict | None = None) -> None:
+        """High-Range anfordern wenn Ziel über der typischen Low-Range-Grenze liegt."""
+        if target < 33.5:
+            return
+        if getattr(self, "_temp_range_forced", False):
+            return
+        await self._force_temp_range_high()
+        if snap:
+            # Anker nach Range-Switch neu setzen
+            st = snap.get("set_temp")
+            if st is not None:
+                self._temp_stable_anchor = float(st)
+                self._last_temp_seen = float(st)
 
     async def _ensure_pumps_off_for_heating(self) -> None:
         """Cameo 880 (40A): Temperaturänderung nur bei ausgeschalteten Jet-Pumpen."""
@@ -2047,6 +2079,7 @@ class SpaClient:
             self._temp_fail_on_code = 0
             self._temp_exploration_round = 0
             self._temp_jump_streak = 0
+            self._temp_range_forced = False
             self._temp_target_bucket = self._temp_bucket(target)
             self._temp_current_bucket = self._temp_bucket(float(snap["set_temp"]))
             self._temp_stable_anchor = float(snap["set_temp"])
@@ -2056,7 +2089,6 @@ class SpaClient:
             if locked and locked in self._temp_blacklist(warmer):
                 self._temp_locked_code = None
             # Alte per-Bucket-Blacklist für den Start-Bucket leicht lockern
-            # (Codes können nach Session-Wechsel wieder taugen)
             start_b = self._temp_current_bucket
             stale = [
                 k for k in self._c6_bucket_blacklist
@@ -2068,7 +2100,9 @@ class SpaClient:
             if warmer and float(snap["set_temp"]) < 33.5:
                 for entry in list(self._learned_c6_up)[-6:]:
                     self._add_c6_to_bucket(True, entry, float(snap["set_temp"]), 0)
-                    self._add_c6_to_bucket(True, entry, min(target, float(snap["set_temp"]) + 2.0), 0)
+                    self._add_c6_to_bucket(
+                        True, entry, min(target, float(snap["set_temp"]) + 2.0), 0
+                    )
             self._last_temp_seen = float(snap["set_temp"])
             self._debug_cmd = True
             self._target_temp = target
@@ -2096,6 +2130,13 @@ class SpaClient:
                 await self._ensure_pumps_off_for_heating()
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.warning("Pumpen-Aus vor Temp fehlgeschlagen: %s", exc)
+
+            # High-Range VOR dem Hochlaufen – sonst endet UP bei ~33–34 und
+            # springt auf den Low-Range-Soll (~28.5) zurück (Log-Muster 34↔28.5).
+            try:
+                await self._ensure_temp_range(target, snap)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("Temp-Range-Switch fehlgeschlagen: %s", exc)
 
             # Menü verlassen falls nötig
             snap2 = await self._status_snapshot()
