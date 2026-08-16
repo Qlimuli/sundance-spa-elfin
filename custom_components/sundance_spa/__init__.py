@@ -49,6 +49,8 @@ STATUS_UPDATE_ALT = 0x16
 LIGHTS_UPDATE_ALT = 0x23
 CC_REQ            = 0xCC
 C6_REQ            = 0xC6  # Cameo iTouch Temp/UI (Panel-Sniff 2026-08-15)
+C7_REQ            = 0xC7  # Cameo Licht-Befehl (Panel-Sniff 2026-08-16)
+C2_UPDATE       = 0xC2  # Cameo Licht-Stream während Blend
 CMD_CHANNEL       = 0x10
 CH_BROADCAST      = 0xFE
 MSG_CHANNEL_REQ    = 0x01
@@ -79,10 +81,13 @@ BTN_PUMP2          = 229
 BTN_CLEARRAY       = 239
 BTN_LIGHT          = 241
 BTN_LIGHT_COLOR    = 242
-# Nur CC-Lichtcodes – KEINE C6 (C6-Replays haben Solltemp auf ~40°C getrieben)
+# Cameo 880: Panel sendet C7 (verschlüsselt), Klartext nach Decrypt = 0x2F / 0x33
+# Helligkeitsstufen am Panel: 0 / 20 / 40 / 60 / 80 / 100 (nicht 33/66)
+LIGHT_C7_BTN       = 0x2F
+LIGHT_C7_B6        = 0x33
 LIGHT_ON_VARIANTS: tuple[tuple[int, int, int], ...] = (
+    (C7_REQ, LIGHT_C7_BTN, LIGHT_C7_B6),
     (CC_REQ, 241, 0),
-    (CC_REQ, 0xF1, 0x00),
 )
 LIGHT_COLOR_VARIANTS: tuple[tuple[int, int, int], ...] = (
     (CC_REQ, 242, 0),
@@ -167,6 +172,10 @@ def _jacuzzi_xor_cipher(packet: bytearray, encrypt: bool = True) -> bytearray:
         key1 = packet[5] ^ 0xDF
     elif packet_type == 0xC6:
         key1 = packet[5] ^ 0xC6  # experimentell
+    elif packet_type == 0xC7:
+        key1 = packet[5] ^ 0xC7  # Cameo Licht (Panel-Sniff 2026-08-16)
+    elif packet_type == 0xC2:
+        key1 = packet[5] ^ 0xC2  # Cameo Licht-Stream
     else:
         return packet
 
@@ -225,6 +234,29 @@ def _build_c6_encrypted(
     msg[2] = channel & 0xFF
     msg[3] = 0xBF
     msg[4] = 0xC6
+    msg[5] = key_byte & 0xFF
+    msg[6] = btn & 0xFF
+    msg[7] = b6 & 0xFF
+    msg[8] = 0
+    msg[9] = M_STARTEND
+    msg = _jacuzzi_xor_cipher(msg, encrypt=True)
+    return bytes(msg)
+
+
+def _build_c7(
+    btn: int = LIGHT_C7_BTN,
+    b6: int = LIGHT_C7_B6,
+    channel: int = CMD_CHANNEL,
+    key_byte: int = 0,
+) -> bytes:
+    """Cameo Licht-Befehl 0xC7 (verschlüsselt, Panel-Sniff: Klartext 0x2F/0x33)."""
+    ml = 8
+    msg = bytearray(10)
+    msg[0] = M_STARTEND
+    msg[1] = ml
+    msg[2] = channel & 0xFF
+    msg[3] = 0xBF
+    msg[4] = C7_REQ
     msg[5] = key_byte & 0xFF
     msg[6] = btn & 0xFF
     msg[7] = b6 & 0xFF
@@ -399,13 +431,17 @@ def _decode_set_temp(raw: int, _celsius_scale: bool) -> float:
 
 
 def _brightness_step(level_pct: int) -> int:
-    """Spa-Helligkeitsstufen (0 / 33 / 66 / 100)."""
+    """Cameo-Helligkeitsstufen (0 / 20 / 40 / 60 / 80 / 100)."""
     if level_pct <= 0:
         return 0
-    if level_pct < 50:
-        return 33
-    if level_pct < 83:
-        return 66
+    if level_pct <= 20:
+        return 20
+    if level_pct <= 40:
+        return 40
+    if level_pct <= 60:
+        return 60
+    if level_pct <= 80:
+        return 80
     return 100
 
 
@@ -1399,11 +1435,7 @@ class SpaClient:
 
 
     async def _send_light_step(self, color: bool = False) -> None:
-        """Licht: CC 0xF1 = Ein/Aus, CC 0xF2 = Farbe (Log 13:26 bestätigt)."""
-        if color:
-            mtype, btn, b6 = CC_REQ, 0xF2, 0x00
-        else:
-            mtype, btn, b6 = CC_REQ, 0xF1, 0x00
+        """Licht Cameo: C7 0x2F/0x33 (Panel-Sniff). Farbe-Fallback CC 0xF2."""
         if self._light_attempt >= 12:
             _LOGGER.error("Licht-Versuche erschöpft – Abbruch")
             self._target_light_brightness = LIGHT_NO_CHANGE
@@ -1414,14 +1446,26 @@ class SpaClient:
             return
         self._assigned_channel = CMD_CHANNEL
         await self._wait_pending_clear(timeout=2.0)
-        _LOGGER.warning(
-            "Licht-Schritt %s mtype=0x%02X btn=0x%02X attempt=%d ch=0x10",
-            "COLOR" if color else "ON/OFF",
-            mtype,
-            btn,
-            self._light_attempt + 1,
-        )
-        await self._queue_cc(btn, mtype, b6)
+        if color:
+            _LOGGER.warning(
+                "Licht-Befehl COLOR mtype=0xCC btn=0xF2 attempt=%d ch=0x10",
+                self._light_attempt + 1,
+            )
+            await self._queue_cc(0xF2, CC_REQ, 0x00)
+        else:
+            key_byte = (self._light_attempt * 0x17) & 0xFF
+            pkt = _build_c7(
+                LIGHT_C7_BTN, LIGHT_C7_B6, CMD_CHANNEL, key_byte=key_byte
+            )
+            _LOGGER.warning(
+                "Licht-Befehl C7 btn=0x%02X b6=0x%02X key=0x%02X attempt=%d pkt=%s",
+                LIGHT_C7_BTN,
+                LIGHT_C7_B6,
+                key_byte,
+                self._light_attempt + 1,
+                pkt.hex(" "),
+            )
+            await self._queue_raw(pkt)
         self._light_attempt += 1
 
     async def _handle_light_feedback(self, lights: dict) -> None:
