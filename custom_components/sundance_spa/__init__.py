@@ -297,30 +297,35 @@ TEMP_RANGE_HI_CC_BTN = 141
 TEMP_RANGE_HI_CC_B6  = 69
 BTN_MENU = 254
 
-# Seed aus Panel-Sniff 2026-08-16 (nur als C6-Fallback, Direct-Set ist primär)
+# Seed aus Panel-Sniff 11:41 (frisch, Log-verifiziert)
 SEED_DOWN_C6: list[tuple[int, int, int]] = [
-    (0xC6, 0x44, 0xF4),  # 28.5→28.0
-    (0xC6, 0x4C, 0xFD),  # 29.0→28.5
-    (0xC6, 0x25, 0x97),  # 29.5→29.0
-    (0xC6, 0x9F, 0x2C),  # 30.0→29.5
-    (0xC6, 0x05, 0xB1),  # 30.5→30.0
-    (0xC6, 0xDC, 0x69),  # 31.0→30.5
+    (0xC6, 0x92, 0x22),  # 28.5→28.0
+    (0xC6, 0x4E, 0xFF),  # 29.0→28.5
+    (0xC6, 0xF8, 0x4A),  # 29.5→29.0
+    (0xC6, 0x0E, 0xBD),  # 30.0→29.5
+    (0xC6, 0x42, 0xF6),  # 30.5→30.0
+    (0xC6, 0x48, 0xFD),  # 31.0→30.5
+    (0xC6, 0x86, 0x30),  # 31.5→31.0
+    (0xC6, 0xC3, 0x74),  # 32.0→31.5
 ]
 SEED_UP_C6: list[tuple[int, int, int]] = [
-    (0xC6, 0x29, 0x9C),  # 30.0→30.5
-    (0xC6, 0x1D, 0xA9),  # 29.5→30.0
-    (0xC6, 0x5D, 0xEE),  # 29.0→29.5
-    (0xC6, 0xE6, 0x50),  # 30.5→31.0
-    (0xC6, 0xDC, 0x6B),  # 31.0→31.5
-    (0xC6, 0x5E, 0x96),  # 31.5→32.0
+    (0xC6, 0x68, 0xDF),  # 31.0→31.5
+    (0xC6, 0xA7, 0x6F),  # 31.5→32.0
+    (0xC6, 0x58, 0x91),  # 32.0→32.5
+    (0xC6, 0xA6, 0x6C),  # 32.5→33.0
+    (0xC6, 0x07, 0xCC),  # 33.0→33.5
+    (0xC6, 0xF0, 0x3C),  # 33.5→34.0
+    (0xC6, 0x14, 0xD3),  # 39.0→39.5
+    (0xC6, 0x67, 0xA1),  # 38.5→39.0
 ]
 
-# Cameo C6 ist rollierend – Replay alter Codes ist unzuverlässig.
-# Strategie: Direct-Set 0x20 zuerst, dann Klartext-CC, C6 nur frisch.
-TEMP_STALL_BEFORE_FALLBACK = 3
-TEMP_MAX_ATTEMPTS = 36
-TEMP_LEARN_POOL_MAX = 12          # nur die neuesten Panel-Codes behalten
-TEMP_RANGE_JUMP_C = 2.0           # Sprünge >= 2°C = Range-Umschaltung, kein Step
+# Cameo: C6-Codes sind sitzungsabhängig; frische Codes + Lock bei Erfolg.
+# Direct-Set 0x20 wird vom Board oft ignoriert → C6 primär, CC/0x20 Fallback.
+TEMP_STALL_BEFORE_FALLBACK = 4
+TEMP_MAX_ATTEMPTS = 40
+TEMP_LEARN_POOL_MAX = 16          # neueste Panel-/Erfolgs-Codes
+TEMP_RANGE_JUMP_C = 2.5           # >= 2.5°C = Range/Unit, kein 0.5°-Step
+TEMP_FLOOR_PROBE = 3              # nach N Downs ohne Bewegung unter aktueller Temp → Floor
 
 
 
@@ -669,16 +674,19 @@ class SpaClient:
                         [f"0x{c:02X}" for c in self._discovered_channels],
                     )
 
-                if self._assigned_channel is not None and channel == self._assigned_channel:
-                    self._cts_own += 1
-                    await self._flush_pending(channel)
-                elif (
-                    self._assigned_channel is not None
-                    and self._pending
-                    and len(self._discovered_channels) <= 2
-                ):
-                    # Cameo: manchmal CTS auf 0x11 während wir 0x10 nutzen
-                    await self._flush_pending(self._assigned_channel)
+                # Immer flushen wenn Pending wartet – Cameo oft nur 1 Kanal
+                if self._pending:
+                    if (
+                        self._assigned_channel is not None
+                        and channel == self._assigned_channel
+                    ):
+                        self._cts_own += 1
+                        await self._flush_pending(channel)
+                    elif self._assigned_channel is not None:
+                        self._cts_own += 1
+                        await self._flush_pending(self._assigned_channel)
+                    else:
+                        await self._flush_pending(channel)
 
                 # Idle-Kanal wählen, falls noch kein Assignment
                 if self._detect_state < DETECT_CHANNEL_CYCLES:
@@ -876,21 +884,19 @@ class SpaClient:
             _LOGGER.info("Channel Fallback: 0x%02X", CMD_CHANNEL)
 
     async def _flush_pending(self, channel: int) -> None:
-        """Sendet ein wartendes Paket auf CTS-Kanal (oder beliebig wenn Solo-Kanal)."""
+        """Sendet ein wartendes Paket (Kanal-Match oder erstes bei Solo/Cameo)."""
         assert self._writer is not None
         async with self._pending_lock:
             if not self._pending:
                 return
-            # Primär exakter Kanal, sonst erstes Paket (Cameo oft nur 1 Kanal)
             idx_send = None
             for idx, (pkt_ch, pkt) in enumerate(self._pending):
                 if pkt_ch == channel:
                     idx_send = idx
                     break
-            if idx_send is None and len(self._discovered_channels) <= 1:
-                idx_send = 0
             if idx_send is None:
-                return
+                # Cameo: trotzdem senden – sonst bleibt Pending ewig stecken
+                idx_send = 0
             pkt_ch, pkt = self._pending.pop(idx_send)
             self._writer.write(pkt)
             await self._writer.drain()
@@ -912,8 +918,24 @@ class SpaClient:
         self._writer.write(packet)
         await self._writer.drain()
 
+    async def _force_send_pending(self) -> None:
+        """Notfall: steckengebliebenes Pending sofort senden (ohne CTS)."""
+        assert self._writer is not None
+        async with self._pending_lock:
+            if not self._pending:
+                return
+            pkt_ch, pkt = self._pending.pop(0)
+        self._writer.write(pkt)
+        await self._writer.drain()
+        self._cc_sent += 1
+        self._last_cc_hex = pkt.hex(" ")
+        _LOGGER.warning(
+            "TX FORCE (kein CTS) pkt_ch=0x%02X sent=%d: %s",
+            pkt_ch, self._cc_sent, self._last_cc_hex,
+        )
+
     async def _wait_pending_clear(self, timeout: float = PENDING_WAIT_S) -> bool:
-        """Wartet, bis die Pending-Queue leer ist (CTS hat gesendet) oder Timeout."""
+        """Wartet auf leere Pending-Queue; bei Timeout Force-Send."""
         elapsed = 0.0
         while elapsed < timeout:
             async with self._pending_lock:
@@ -925,12 +947,12 @@ class SpaClient:
             left = len(self._pending)
         if left:
             _LOGGER.warning(
-                "Pending-CC nach %.1fs noch nicht gesendet (%d wartend, cts_own=%d)",
-                timeout,
-                left,
-                self._cts_own,
+                "Pending-CC nach %.1fs stecken (%d) cts_own=%d → Force-Send",
+                timeout, left, self._cts_own,
             )
-        return left == 0
+            await self._force_send_pending()
+            return True
+        return True
 
     async def _queue_cc(self, btn: int, mtype: int = CC_REQ, b6: int = 0) -> None:
         """Reiht einen Tastenbefehl ein – wartet ggf. auf freien Slot, droppt nicht sofort."""
@@ -1041,9 +1063,13 @@ class SpaClient:
             self._learned_c6_down = [c for c in self._learned_c6_down if c != entry]
             if entry in self._learned_c6_up:
                 self._learned_c6_up.remove(entry)
-            self._learned_c6_up.append(entry)  # neueste ans Ende
+            self._learned_c6_up.append(entry)
             self._learned_c6_up = self._learned_c6_up[-TEMP_LEARN_POOL_MAX:]
-            self._c6_score[entry] = self._c6_score.get(entry, 0) + 2
+            self._c6_score[entry] = max(self._c6_score.get(entry, 0), 0) + 3
+            self._temp_blacklist_up.discard(entry)
+            # Frischer Panel-Code: Blacklist der Richtung etwas auflockern
+            if len(self._temp_blacklist_up) > 8:
+                self._temp_blacklist_up.clear()
             _LOGGER.warning(
                 "LEARN-UP C6 btn=0x%02X b6=0x%02X (%.1f→%.1f) pool=%d",
                 btn, b6, prev, new_set, len(self._learned_c6_up),
@@ -1054,7 +1080,10 @@ class SpaClient:
                 self._learned_c6_down.remove(entry)
             self._learned_c6_down.append(entry)
             self._learned_c6_down = self._learned_c6_down[-TEMP_LEARN_POOL_MAX:]
-            self._c6_score[entry] = self._c6_score.get(entry, 0) + 2
+            self._c6_score[entry] = max(self._c6_score.get(entry, 0), 0) + 3
+            self._temp_blacklist_down.discard(entry)
+            if len(self._temp_blacklist_down) > 8:
+                self._temp_blacklist_down.clear()
             _LOGGER.warning(
                 "LEARN-DOWN C6 btn=0x%02X b6=0x%02X (%.1f→%.1f) pool=%d",
                 btn, b6, prev, new_set, len(self._learned_c6_down),
@@ -1065,22 +1094,32 @@ class SpaClient:
         return self._temp_blacklist_up if warmer else self._temp_blacklist_down
 
     def _pick_temp_codes(self, warmer: bool) -> list[tuple[int, int, int]]:
-        """Nur die neuesten gelernten C6-Codes (rollierend – alt = nutzlos)."""
+        """Lock-Code zuerst, dann neueste gelernte C6 (ohne Blacklist)."""
         scores = getattr(self, "_c6_score", {})
         bl = self._temp_blacklist(warmer)
         pool = list(self._learned_c6_up if warmer else self._learned_c6_down)
-        # Neueste zuerst (Append-Reihenfolge)
         candidates: list[tuple[int, int, int]] = []
+        locked = getattr(self, "_temp_locked_code", None)
+        if (
+            locked
+            and isinstance(locked, tuple)
+            and len(locked) == 3
+            and locked[0] == 0xC6
+            and locked not in bl
+        ):
+            candidates.append(locked)
         for c in reversed(pool):
-            if c in bl or scores.get(c, 0) < -2:
+            if c in bl or c in candidates:
+                continue
+            if scores.get(c, 0) < -3:
                 continue
             candidates.append(c)
-            if len(candidates) >= 6:
+            if len(candidates) >= 8:
                 break
         return candidates
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """Primär Direct-Set 0x20, dann Klartext-CC, zuletzt frische C6."""
+        """C6 (Lock/frisch) primär → Klartext-CC → Direct-Set. Pending nie blockieren."""
         if self._assigned_channel is None:
             self._assigned_channel = CMD_CHANNEL
 
@@ -1092,54 +1131,44 @@ class SpaClient:
             self._temp_done.set()
             return
 
-        await self._wait_pending_clear(timeout=3.0)
+        await self._wait_pending_clear(timeout=2.5)
 
         stall = getattr(self, "_temp_stall_rounds", 0)
-        mode = getattr(self, "_temp_send_mode", 0)
+        # Runden-basiert: C6 → alle 4 Stalls CC → alle 8 Stalls Direct
+        use_cc = stall >= TEMP_STALL_BEFORE_FALLBACK and (stall % 2 == 0)
+        use_direct = stall >= TEMP_STALL_BEFORE_FALLBACK * 2 and (stall % 3 == 0)
 
-        # Escalation: Direct-Set (0) → Klartext (1) → C6 (2)
-        if stall >= TEMP_STALL_BEFORE_FALLBACK * 2 and mode < 2:
-            mode = 2
-            self._temp_send_mode = 2
-            _LOGGER.warning("Temp-Fallback → C6-frisch (stall=%d)", stall)
-        elif stall >= TEMP_STALL_BEFORE_FALLBACK and mode < 1:
-            mode = 1
-            self._temp_send_mode = 1
-            _LOGGER.warning("Temp-Fallback → Klartext-CC 225/226 (stall=%d)", stall)
-
-        # Mode 0: Direct-Set 0x20 (primär – unabhängig von Rolling-Codes)
-        if mode == 0:
+        if use_direct:
             await self._try_direct_set(self._target_temp)
             self._last_temp_code = ("direct", 0x20, 0)
             self._last_temp_warmer = warmer
             self._command_attempts += 1
             return
 
-        # Mode 1: Klartext-CC TEMP_UP / TEMP_DOWN
-        if mode == 1:
-            btn, b6 = (BTN_TEMP_UP, 0) if warmer else (BTN_TEMP_DOWN, 0)
-            label = "TEMP_UP_CC" if warmer else "TEMP_DOWN_CC"
+        if use_cc:
+            btn = BTN_TEMP_UP if warmer else BTN_TEMP_DOWN
             _LOGGER.warning(
-                "Temp-Schritt %s btn=%d attempt=%d stall=%d",
-                label, btn, self._command_attempts + 1, stall,
+                "Temp-Schritt CC btn=%d attempt=%d stall=%d",
+                btn, self._command_attempts + 1, stall,
             )
-            self._last_temp_code = (0xCC, btn, b6)
+            self._last_temp_code = (0xCC, btn, 0)
             self._last_temp_warmer = warmer
-            await self._queue_cc(btn, CC_REQ, b6)
+            await self._queue_cc(btn, CC_REQ, 0)
             self._last_temp_cmd_ts = time.monotonic()
             self._command_attempts += 1
             return
 
-        # Mode 2: nur frisch gelernte C6 (aus Panel-Sniff)
         codes = self._pick_temp_codes(warmer)
-        label = "TEMP_UP_C6" if warmer else "TEMP_DOWN_C6"
         if not codes:
-            _LOGGER.warning("Temp: keine frischen C6 → zurück zu Direct-Set")
-            self._temp_send_mode = 0
-            self._temp_stall_rounds = 0
-            await self._try_direct_set(self._target_temp)
-            self._last_temp_code = ("direct", 0x20, 0)
+            # Pool leer (alles blacklisted) → Blacklist leeren, Seeds nutzen
+            bl = self._temp_blacklist(warmer)
+            bl.clear()
+            codes = self._pick_temp_codes(warmer)
+        if not codes:
+            btn = BTN_TEMP_UP if warmer else BTN_TEMP_DOWN
+            self._last_temp_code = (0xCC, btn, 0)
             self._last_temp_warmer = warmer
+            await self._queue_cc(btn, CC_REQ, 0)
             self._command_attempts += 1
             return
 
@@ -1147,22 +1176,26 @@ class SpaClient:
         mtype, btn, b6 = codes[idx]
         pkt = _build_cc(btn, self._assigned_channel, mtype, b6)
         scores = getattr(self, "_c6_score", {})
+        locked = getattr(self, "_temp_locked_code", None) == (mtype, btn, b6)
         _LOGGER.warning(
-            "Temp-Schritt %s btn=0x%02X b6=0x%02X score=%s idx=%d/%d "
-            "attempt=%d stall=%d",
-            label, btn, b6, scores.get((mtype, btn, b6), 0),
-            idx, len(codes), self._command_attempts + 1, stall,
+            "Temp-Schritt C6 %s btn=0x%02X b6=0x%02X score=%s idx=%d/%d "
+            "attempt=%d stall=%d locked=%s",
+            "UP" if warmer else "DOWN",
+            btn, b6, scores.get((mtype, btn, b6), 0),
+            idx, len(codes), self._command_attempts + 1, stall, locked,
         )
         self._last_temp_code = (mtype, btn, b6)
         self._last_temp_warmer = warmer
         await self._queue_raw(pkt)
         self._last_temp_cmd_ts = time.monotonic()
         self._command_attempts += 1
-        self._temp_code_idx = idx + 1
+        # Bei Lock denselben Code behalten, sonst rotieren
+        if not locked:
+            self._temp_code_idx = idx + 1
 
 
     async def _handle_temp_feedback(self, status: dict) -> None:
-        """Score/Blacklist; Fortschritt belohnen; GEGEN blacklisten; Stall→Fallback."""
+        """Lock bei Erfolg, Blacklist bei GEGEN, Floor-Erkennung, autonomes Lernen."""
         if self._target_temp == NO_CHANGE_REQUESTED:
             return
         if self._temp_check > 0:
@@ -1172,19 +1205,19 @@ class SpaClient:
         current = float(status["set_temp"])
         if abs(current - self._target_temp) < 0.3:
             _LOGGER.warning(
-                "Soll-Temperatur erreicht: %.1f °C attempts=%d",
+                "Soll-Temperatur erreicht: %.1f °C attempts=%d locked=%s",
                 current, self._command_attempts,
+                getattr(self, "_temp_locked_code", None),
             )
             self._target_temp = NO_CHANGE_REQUESTED
             self._temp_done.set()
             return
 
-        # Menü verlassen, falls Panel dazwischen gerutscht ist
         if status.get("in_menu"):
             _LOGGER.warning("Temp: Panel im Menü – BTN_MENU")
             await self._queue_cc(BTN_MENU)
-            await self._wait_pending_clear()
-            self._temp_check = 3
+            await self._wait_pending_clear(timeout=2.0)
+            self._temp_check = 2
             return
 
         if self._last_temp_seen is None:
@@ -1200,7 +1233,6 @@ class SpaClient:
         if not hasattr(self, "_c6_score"):
             self._c6_score = {}
 
-        # Nur echte C6-Tuples scoren (nicht "direct"/Klartext-Marker)
         is_c6 = (
             isinstance(code, tuple)
             and len(code) == 3
@@ -1209,57 +1241,54 @@ class SpaClient:
         )
 
         if moved and err_now < err_prev - 0.15:
-            # Fortschritt in Zielrichtung
+            # Erfolg → Code locken und behalten
             self._temp_stall_rounds = 0
-            self._temp_progress_at = self._command_attempts
+            self._temp_fail_on_code = 0
             if is_c6:
-                self._c6_score[code] = self._c6_score.get(code, 0) + 4
+                self._temp_locked_code = code
+                self._c6_score[code] = self._c6_score.get(code, 0) + 5
                 if delta > 0:
                     if code not in self._learned_c6_up:
                         self._learned_c6_up.append(code)
                     self._learned_c6_down = [c for c in self._learned_c6_down if c != code]
                     self._temp_blacklist_down.discard(code)
+                    self._temp_blacklist_up.discard(code)
                 elif delta < 0:
                     if code not in self._learned_c6_down:
                         self._learned_c6_down.append(code)
                     self._learned_c6_up = [c for c in self._learned_c6_up if c != code]
                     self._temp_blacklist_up.discard(code)
+                    self._temp_blacklist_down.discard(code)
             self._temp_steps_done = getattr(self, "_temp_steps_done", 0) + 1
             _LOGGER.warning(
-                "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code=%s score=%s | Pause 1.5s",
+                "Temp-Fortschritt: %.1f → %.1f (Ziel %.1f) code=%s score=%s LOCK | Pause 1.2s",
                 prev, current, self._target_temp, code,
                 self._c6_score.get(code, 0) if is_c6 else "-",
             )
             self._last_temp_seen = current
-            self._temp_check = 3
-            await asyncio.sleep(1.5)
+            self._temp_check = 2
+            await asyncio.sleep(1.2)
             if self._target_temp == NO_CHANGE_REQUESTED:
                 return
             await self._send_temp_step(self._target_temp > current)
             return
 
         if moved and err_now > err_prev + 0.15:
-            # GEGEN die Zielrichtung → hart blacklisten für die genutzte Richtung
+            # GEGEN → Unlock + Blacklist
             self._temp_stall_rounds = getattr(self, "_temp_stall_rounds", 0) + 1
+            self._temp_locked_code = None
             if is_c6:
-                self._c6_score[code] = self._c6_score.get(code, 0) - 8
-                # Richtung, die wir gerade steuern wollten, bekommt Blacklist
+                self._c6_score[code] = self._c6_score.get(code, 0) - 6
                 wanted_warmer = bool(getattr(self, "_last_temp_warmer", warmer_needed))
                 if wanted_warmer:
                     self._temp_blacklist_up.add(code)
                     self._learned_c6_up = [c for c in self._learned_c6_up if c != code]
-                    if code not in self._learned_c6_down:
-                        self._learned_c6_down.append(code)
                 else:
                     self._temp_blacklist_down.add(code)
                     self._learned_c6_down = [c for c in self._learned_c6_down if c != code]
-                    if code not in self._learned_c6_up:
-                        self._learned_c6_up.append(code)
             _LOGGER.warning(
-                "Temp GEGEN: %.1f → %.1f code=%s → blacklist score=%s stall=%d",
-                prev, current, code,
-                self._c6_score.get(code, 0) if is_c6 else "-",
-                self._temp_stall_rounds,
+                "Temp GEGEN: %.1f → %.1f code=%s blacklist stall=%d",
+                prev, current, code, self._temp_stall_rounds,
             )
             self._last_temp_seen = current
         else:
@@ -1267,6 +1296,38 @@ class SpaClient:
             self._temp_stall_rounds = getattr(self, "_temp_stall_rounds", 0) + 1
             if is_c6:
                 self._c6_score[code] = self._c6_score.get(code, 0) - 1
+                # Nach mehreren Fehlversuchen denselben Code unlocken
+                if getattr(self, "_temp_locked_code", None) == code:
+                    self._temp_fail_on_code = getattr(self, "_temp_fail_on_code", 0) + 1
+                    if self._temp_fail_on_code >= 3:
+                        _LOGGER.warning("Temp-Lock gelöst nach 3 Fehlversuchen: %s", code)
+                        self._temp_locked_code = None
+                        self._temp_fail_on_code = 0
+
+            # Spa-Minimum (Floor): mehrmals DOWN ohne Bewegung unter aktueller Temp
+            if (
+                not warmer_needed
+                and not moved
+                and self._temp_stall_rounds >= TEMP_FLOOR_PROBE
+                and abs(current - self._target_temp) > 0.3
+                and current <= self._target_temp + 0.5
+            ):
+                # wir sind schon am/unter Ziel – ok
+                pass
+            elif (
+                not warmer_needed
+                and not moved
+                and self._temp_stall_rounds >= TEMP_FLOOR_PROBE + 2
+                and current <= 28.5
+                and self._target_temp < current - 0.2
+            ):
+                _LOGGER.warning(
+                    "Temp-Floor erreicht: ist=%.1f Ziel=%.1f – akzeptiere Minimum",
+                    current, self._target_temp,
+                )
+                self._target_temp = NO_CHANGE_REQUESTED
+                self._temp_done.set()
+                return
 
         if self._command_attempts >= TEMP_MAX_ATTEMPTS:
             _LOGGER.error(
@@ -1280,7 +1341,7 @@ class SpaClient:
             return
 
         await self._send_temp_step(self._target_temp > current)
-        self._temp_check = 3
+        self._temp_check = 2
 
 
     async def _try_direct_set(self, target: float) -> None:
@@ -1484,14 +1545,22 @@ class SpaClient:
             self._temp_stall_rounds = 0
             self._temp_progress_at = 0
             self._temp_code_idx = 0
+            self._temp_fail_on_code = 0
+            # Lock behalten wenn Richtung passt, sonst neu lernen
+            locked = getattr(self, "_temp_locked_code", None)
+            warmer = target > snap["set_temp"]
+            if locked and locked in self._temp_blacklist(warmer):
+                self._temp_locked_code = None
             self._last_temp_seen = float(snap["set_temp"])
             self._debug_cmd = True
             self._target_temp = target
 
             _LOGGER.warning(
                 "set_temperature START | Ziel=%.1f aktuell=%.1f kanal=0x%02X "
-                "| Modus=0x20→CC→C6 (Cameo rolling)",
+                "| Modus=C6-Lock→CC→0x20 pool_up=%d pool_down=%d lock=%s",
                 target, snap["set_temp"], ch,
+                len(self._learned_c6_up), len(self._learned_c6_down),
+                self._temp_locked_code,
             )
 
             # Cameo 880 (40A): Jet-Pumpen aus, sonst ignoriert Panel Temp-Tasten
