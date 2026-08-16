@@ -546,6 +546,8 @@ class SpaClient:
         self._target_light_mode = LIGHT_NO_CHANGE
         self._light_done = asyncio.Event()
         self._light_check = 0
+        self._recent_bus: list[tuple[float, str]] = []  # (ts, summary)
+        self._last_light_bright: int | None = None
         # Problematische DOWN-Codes von Anfang an blacklisten
         for bad in TEMP_DOWN_BAD:
             self._temp_blacklist_down.add(bad)
@@ -730,6 +732,10 @@ class SpaClient:
                         recent = getattr(self, "_recent_tx", set())
                         is_ours = raw_hex in recent
                         src = "EIGEN" if is_ours else "PANEL"
+                        self._note_bus(
+                            f"CC {src} ch=0x{channel:02X} "
+                            f"btn=0x{btn_b5:02X} b6=0x{b6:02X} {raw_hex}"
+                        )
                         if src == "PANEL":
                             if channel not in self._active_channels:
                                 self._active_channels.append(channel)
@@ -783,6 +789,9 @@ class SpaClient:
                                 dec[7] if len(dec) > 7 else 0,
                             )
                             btn, b6 = msg[6], msg[7] if len(msg) > 7 else 0
+                            self._note_bus(
+                                f"C6-ENC btn=0x{btn:02X} b6=0x{b6:02X} {raw_hex}"
+                            )
                         else:
                             btn, b6 = msg[5], msg[6] if len(msg) > 6 else 0
                             _LOGGER.warning(
@@ -790,16 +799,26 @@ class SpaClient:
                                 "xor=0x%02X sum=0x%02X raw=%s",
                                 channel, btn, b6, btn ^ b6, (btn + b6) & 0xFF, raw_hex,
                             )
+                            self._note_bus(
+                                f"C6 ch=0x{channel:02X} btn=0x{btn:02X} "
+                                f"b6=0x{b6:02X} {raw_hex}"
+                            )
                         self._panel_c6_recent.append((time.monotonic(), btn, b6))
                         if len(self._panel_c6_recent) > 80:
                             self._panel_c6_recent = self._panel_c6_recent[-60:]
-                elif self._debug_cmd:
-                    _LOGGER.debug(
-                        "BUS-MSG unbekannt | ch=0x%02X mtype=0x%02X raw=%s",
-                        channel,
-                        mtype,
-                        msg.hex(" "),
+                else:
+                    # Unbekannte Typen immer im Ringpuffer (auch ohne debug_cmd)
+                    self._note_bus(
+                        f"UNK ch=0x{channel:02X} mtype=0x{mtype:02X} "
+                        f"{msg.hex(' ')}"
                     )
+                    if self._debug_cmd:
+                        _LOGGER.warning(
+                            "BUS-MSG unbekannt | ch=0x%02X mtype=0x%02X raw=%s",
+                            channel,
+                            mtype,
+                            msg.hex(" "),
+                        )
 
             # ── Status / Lights ─────────────────────────────────────────────
             if mtype in (STATUS_UPDATE, STATUS_UPDATE_ALT):
@@ -839,6 +858,22 @@ class SpaClient:
             elif mtype in (LIGHTS_UPDATE, LIGHTS_UPDATE_ALT):
                 dec = _decode_ca(msg)
                 if dec:
+                    bright = int(dec.get("brightness_raw") or 0)
+                    mode_raw = dec.get("mode_raw")
+                    prev_b = self._last_light_bright
+                    if prev_b is None or prev_b != bright:
+                        buf = list(self._recent_bus[-12:])
+                        _LOGGER.warning(
+                            "LIGHT-CHANGE | bright %s→%s mode=%s mode_raw=%s "
+                            "on=%s | recent_bus=%s",
+                            prev_b,
+                            bright,
+                            dec.get("mode"),
+                            mode_raw,
+                            dec.get("on"),
+                            buf,
+                        )
+                        self._last_light_bright = bright
                     async with self._lock:
                         self._lights = dec
                         self._lights_seq += 1
@@ -855,6 +890,12 @@ class SpaClient:
                             dec.get("b"),
                         )
                     await self._handle_light_feedback(dec)
+
+    def _note_bus(self, summary: str) -> None:
+        """Ringpuffer der letzten Bus-Nachrichten (für Licht-Korrelation)."""
+        self._recent_bus.append((round(time.monotonic(), 2), summary))
+        if len(self._recent_bus) > 40:
+            self._recent_bus = self._recent_bus[-30:]
 
     def _pick_idle_channel(self) -> None:
         """Wählt CTS-Kanal. 0x10 ist OK wenn kein anderer existiert (Cameo oft nur 0x10)."""
