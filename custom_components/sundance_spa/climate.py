@@ -34,8 +34,8 @@ class SpaClimate(CoordinatorEntity, ClimateEntity):
     _attr_has_entity_name      = True
     _attr_name                 = "Thermostat"
     _attr_temperature_unit     = UnitOfTemperature.CELSIUS
-    # Cameo 880: High-Range oft ab ~28 °C; Low-Range ~26.5 – UI ab 26.5
-    _attr_min_temp             = 26.5
+    # Cameo 880: Low-Range bis 16.5 °C, High-Range bis 40.0 °C
+    _attr_min_temp             = 16.5
     _attr_max_temp             = 40.0
     _attr_target_temperature_step = 0.5
     _attr_hvac_modes           = [HVACMode.HEAT, HVACMode.OFF]
