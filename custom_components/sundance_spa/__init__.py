@@ -414,6 +414,40 @@ TEMP_EXPLORE_C6: tuple[tuple[int, int, int], ...] = (
 
 
 
+def _c6_xor_for_temp(celsius: float) -> int:
+    """Cameo C6: btn^b6 == round(°C*2) ^ 0x88 (20/20 LEARN-Punkte verifiziert).
+
+    Codiert den *Ergebnis*-Sollwert nach dem ±0.5-Schritt.
+    """
+    raw = int(round(float(celsius) * 2.0))
+    raw = max(33, min(80, raw))
+    return (raw ^ 0x88) & 0xFF
+
+
+def _synthesize_c6_pair(
+    result_temp_c: float,
+    preferred_btn: int | None = None,
+    salt: int = 0,
+) -> tuple[int, int]:
+    """(btn, b6) mit korrektem xor für result_temp_c.
+
+    btn ist unterbestimmt – preferred_btn (letzter Panel-Sniff) bevorzugen.
+    """
+    xor = _c6_xor_for_temp(result_temp_c)
+    if preferred_btn is not None:
+        btn = preferred_btn & 0xFF
+    else:
+        raw = int(round(float(result_temp_c) * 2.0))
+        btn = (raw * 3 + salt * 17 + 0x2F) & 0xFF
+    b6 = (btn ^ xor) & 0xFF
+    return btn, b6
+
+
+def _build_c6_plain(btn: int, b6: int, channel: int = CMD_CHANNEL) -> bytes:
+    """Panel-identisches C6 (Länge 7, Klartext + Balboa-CRC)."""
+    return _build_cc(btn, channel, C6_REQ, b6)
+
+
 def _build_set_temp(channel: int, celsius: float) -> bytes:
     """Direkt-Solltemperatur (Msg 0x20). Wert = °C × 2 (halbe Grad)."""
     val = int(round(celsius * 2.0))
@@ -1524,7 +1558,7 @@ class SpaClient:
         return candidates
 
     async def _send_temp_step(self, warmer: bool) -> None:
-        """C6 primär → CC → selten Direct. Rate-Limit + Pending-Flush."""
+        """C6-Synthese (xor=raw^0x88) primär → gelernte Seeds → selten CC."""
         if self._assigned_channel is None:
             self._assigned_channel = CMD_CHANNEL
 
@@ -1537,7 +1571,7 @@ class SpaClient:
             self._temp_done.set()
             return
 
-        # Rate-Limit: nicht schneller als TEMP_MIN_STEP_GAP senden
+        # Rate-Limit
         last_ts = getattr(self, "_last_temp_cmd_ts", 0.0) or 0.0
         gap = time.monotonic() - last_ts
         if gap < TEMP_MIN_STEP_GAP:
@@ -1546,29 +1580,79 @@ class SpaClient:
         await self._wait_pending_clear(timeout=PENDING_WAIT_S)
 
         stall = getattr(self, "_temp_stall_rounds", 0)
-        # CC/Direct oft nutzlos oder schädlich (Dual-Soll) → sehr spät, selten
-        stall_cc = TEMP_STALL_BEFORE_FALLBACK + 8
-        use_cc = stall >= stall_cc and (stall % 5 == 0)
-        use_direct = False  # 0x20 wird vom Cameo-Board ignoriert
+        cur = float(
+            self._last_temp_seen
+            if self._last_temp_seen is not None
+            else (self._target_temp if self._target_temp != NO_CHANGE_REQUESTED else 30.0)
+        )
+        # Nächster Ergebnis-Sollwert (±0.5)
+        step = 0.5 if warmer else -0.5
+        result_temp = round((cur + step) * 2) / 2.0
+        result_temp = max(TEMP_MIN_C, min(TEMP_MAX_C, result_temp))
+        # Nicht über Ziel hinaus schießen
+        if self._target_temp != NO_CHANGE_REQUESTED:
+            if warmer and result_temp > self._target_temp:
+                result_temp = float(self._target_temp)
+            elif not warmer and result_temp < self._target_temp:
+                result_temp = float(self._target_temp)
 
-        if use_direct:
-            await self._try_direct_set(self._target_temp)
-            self._last_temp_code = ("direct", 0x20, 0)
+        # ── Primär: synthetisches C6 mit korrektem xor ─────────────────
+        # preferred_btn aus letztem Panel-Sniff (Board mag bestimmte btn)
+        pref_btn = None
+        recent = getattr(self, "_panel_c6_recent", [])
+        if recent:
+            pref_btn = recent[-1][1]
+        # Bei Stall: anderen btn-Salt versuchen
+        salt = int(getattr(self, "_temp_synth_salt", 0)) + stall
+        btn, b6 = _synthesize_c6_pair(result_temp, preferred_btn=pref_btn, salt=salt)
+        # Wenn wir einen bekannten Seed mit passendem xor haben → bevorzugen
+        want_xor = _c6_xor_for_temp(result_temp)
+        for entry in (SEED_UP_C6 if warmer else SEED_DOWN_C6):
+            if entry[0] == 0xC6 and (entry[1] ^ entry[2]) == want_xor:
+                btn, b6 = entry[1], entry[2]
+                break
+        # Auch gelernte Pools scannen
+        pool = self._learned_c6_up if warmer else self._learned_c6_down
+        for entry in reversed(list(pool)):
+            if (
+                isinstance(entry, tuple)
+                and len(entry) == 3
+                and entry[0] == 0xC6
+                and (entry[1] ^ entry[2]) == want_xor
+            ):
+                btn, b6 = entry[1], entry[2]
+                break
+
+        use_synth = stall < (TEMP_STALL_BEFORE_FALLBACK + 10)
+        if use_synth:
+            pkt = _build_c6_plain(btn, b6, self._assigned_channel)
+            _LOGGER.warning(
+                "Temp-SYNTH C6 %s btn=0x%02X b6=0x%02X xor=0x%02X "
+                "result=%.1f cur=%.1f attempt=%d stall=%d",
+                "UP" if warmer else "DOWN",
+                btn, b6, btn ^ b6, result_temp, cur,
+                self._command_attempts + 1, stall,
+            )
+            self._last_temp_code = (0xC6, btn, b6)
             self._last_temp_warmer = warmer
+            self._temp_synth_salt = salt + 1
+            await self._queue_raw(pkt)
             self._last_temp_cmd_ts = time.monotonic()
             self._command_attempts += 1
             self._temp_check = TEMP_STATUS_WAIT
             return
 
-        if use_cc:
-            btn = BTN_TEMP_UP if warmer else BTN_TEMP_DOWN
+        # ── Fallback: alte Bucket-Codes / CC ───────────────────────────
+        stall_cc = TEMP_STALL_BEFORE_FALLBACK + 12
+        if stall >= stall_cc and (stall % 5 == 0):
+            cc_btn = BTN_TEMP_UP if warmer else BTN_TEMP_DOWN
             _LOGGER.warning(
                 "Temp-Schritt CC btn=%d attempt=%d stall=%d",
-                btn, self._command_attempts + 1, stall,
+                cc_btn, self._command_attempts + 1, stall,
             )
-            self._last_temp_code = (0xCC, btn, 0)
+            self._last_temp_code = (0xCC, cc_btn, 0)
             self._last_temp_warmer = warmer
-            await self._queue_cc(btn, CC_REQ, 0)
+            await self._queue_cc(cc_btn, CC_REQ, 0)
             self._last_temp_cmd_ts = time.monotonic()
             self._command_attempts += 1
             self._temp_check = TEMP_STATUS_WAIT
