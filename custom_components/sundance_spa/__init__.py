@@ -308,34 +308,41 @@ TEMP_RANGE_HI_CC_BTN = 141
 TEMP_RANGE_HI_CC_B6  = 69
 BTN_MENU = 254
 
-# Seeds: Panel-Sniff + LIVE-Learn 2026-08-17 (28.5→18.5 und Aufstieg).
-# WICHTIG: Jeder echte ±0.5-Schritt nutzt oft einen *anderen* C6-Code
-# (szenarienabhängig). Deshalb Pool rotieren, nicht einen Code hard-locken.
+# Seeds aus Panel-Sniff / LIVE-Learn 2026-08-17.
+# Jeder echte ±0.5-Schritt nutzt oft einen *anderen* C6-Code → Pool rotieren.
 SEED_DOWN_C6: list[tuple[int, int, int]] = [
-    # Low-Range 21→18.5 (Panel-Learn strong)
+    # Low 21→18.5
     (0xC6, 0x66, 0xC7),  # 21.0→20.5
     (0xC6, 0x67, 0xC7),  # 20.5→20.0
     (0xC6, 0xF2, 0x5D),  # 20.0→19.5
     (0xC6, 0xDD, 0x73),  # 19.5→19.0
     (0xC6, 0x30, 0x9D),  # 19.0→18.5
-    # Mid-Range (älter, weiter nutzbar)
-    (0xC6, 0x92, 0x22),  # 28.5→28.0
-    (0xC6, 0x4E, 0xFF),  # 29.0→28.5
-    (0xC6, 0xF8, 0x4A),  # 29.5→29.0
-    (0xC6, 0x0E, 0xBD),  # 30.0→29.5
-    (0xC6, 0x42, 0xF6),  # 30.5→30.0
-    (0xC6, 0x48, 0xFD),  # 31.0→30.5
-    (0xC6, 0x86, 0x30),  # 31.5→31.0
-    (0xC6, 0xC3, 0x74),  # 32.0→31.5
+    # Mid 30→27.5 (frisch 10:19)
+    (0xC6, 0x32, 0x81),  # 30.0→29.5
+    (0xC6, 0xA8, 0x1A),  # 29.5→29.0
+    (0xC6, 0x1C, 0xAD),  # 29.0→28.5
+    (0xC6, 0xCB, 0x7B),  # 28.5→28.0
+    (0xC6, 0xC5, 0x7A),  # 28.0→27.5
+    # High 38.5→38.0
+    (0xC6, 0x93, 0x57),  # 38.5→38.0
+    # ältere Mid
+    (0xC6, 0x92, 0x22), (0xC6, 0x4E, 0xFF), (0xC6, 0xF8, 0x4A),
+    (0xC6, 0x0E, 0xBD), (0xC6, 0x42, 0xF6), (0xC6, 0x48, 0xFD),
+    (0xC6, 0x86, 0x30), (0xC6, 0xC3, 0x74),
 ]
 SEED_UP_C6: list[tuple[int, int, int]] = [
-    # Low-Range 19.5→22.0 (Panel-Learn strong)
+    # Low 19.5→22.0
     (0xC6, 0x7E, 0xDE),  # 19.5→20.0
     (0xC6, 0x24, 0x85),  # 20.0→20.5
     (0xC6, 0xB9, 0x1B),  # 20.5→21.0
     (0xC6, 0x8E, 0x2D),  # 21.0→21.5
     (0xC6, 0x9A, 0x3E),  # 21.5→22.0
-    # Mid/High (älter)
+    # High 36.5→38.5 (Panel-Sniff 10:19)
+    (0xC6, 0x25, 0xE7),  # 36.5→37.0
+    (0xC6, 0xC2, 0x01),  # 37.0→37.5
+    (0xC6, 0x51, 0x95),  # 37.5→38.0
+    (0xC6, 0xD5, 0x10),  # 38.0→38.5
+    # Mid
     (0xC6, 0x68, 0xDF),  # 31.0→31.5
     (0xC6, 0xA7, 0x6F),  # 31.5→32.0
     (0xC6, 0x58, 0x91),  # 32.0→32.5
@@ -383,24 +390,26 @@ TEMP_BUCKETS: tuple[tuple[float, float], ...] = (
     (38.5, 40.5),
 )
 
-# Exploration-Kandidaten: frische Live-Learns zuerst, dann ältere Seeds.
+# Exploration: frische Sniffs zuerst (High 36–38 + Mid 27–30 + Low).
 TEMP_EXPLORE_C6: tuple[tuple[int, int, int], ...] = (
-    # 2026-08-17 Low-Range live
+    # High 36.5–38.5
+    (0xC6, 0x25, 0xE7), (0xC6, 0xC2, 0x01), (0xC6, 0x51, 0x95),
+    (0xC6, 0xD5, 0x10), (0xC6, 0x93, 0x57),
+    # Mid DOWN 30→27.5
+    (0xC6, 0x32, 0x81), (0xC6, 0xA8, 0x1A), (0xC6, 0x1C, 0xAD),
+    (0xC6, 0xCB, 0x7B), (0xC6, 0xC5, 0x7A),
+    # Low
     (0xC6, 0x66, 0xC7), (0xC6, 0x67, 0xC7), (0xC6, 0xF2, 0x5D),
     (0xC6, 0xDD, 0x73), (0xC6, 0x30, 0x9D), (0xC6, 0x7E, 0xDE),
     (0xC6, 0x24, 0x85), (0xC6, 0xB9, 0x1B), (0xC6, 0x8E, 0x2D),
     (0xC6, 0x9A, 0x3E),
-    # Mid-Range bekannt
-    (0xC6, 0x92, 0x22), (0xC6, 0xF8, 0x4A), (0xC6, 0x0E, 0xBD),
-    (0xC6, 0x42, 0xF6), (0xC6, 0x48, 0xFD), (0xC6, 0x4E, 0xFF),
-    (0xC6, 0x86, 0x30), (0xC6, 0xC3, 0x74), (0xC6, 0x68, 0xDF),
-    (0xC6, 0xA7, 0x6F), (0xC6, 0x58, 0x91), (0xC6, 0xA6, 0x6C),
-    (0xC6, 0x07, 0xCC), (0xC6, 0xF0, 0x3C), (0xC6, 0x14, 0xD3),
-    (0xC6, 0x67, 0xA1), (0xC6, 0xF0, 0x47), (0xC6, 0x52, 0xE7),
-    (0xC6, 0x74, 0xC5), (0xC6, 0x15, 0xA5), (0xC6, 0xC8, 0x7C),
-    (0xC6, 0x1A, 0xB0), (0xC6, 0x3D, 0xC1), (0xC6, 0x5B, 0x88),
-    (0xC6, 0x9C, 0x55), (0xC6, 0xB2, 0x19), (0xC6, 0xD4, 0x2E),
-    (0xC6, 0xE1, 0x0A), (0xC6, 0x2F, 0xD8),
+    # Mid UP / ältere
+    (0xC6, 0x68, 0xDF), (0xC6, 0xA7, 0x6F), (0xC6, 0x58, 0x91),
+    (0xC6, 0xA6, 0x6C), (0xC6, 0x07, 0xCC), (0xC6, 0xF0, 0x3C),
+    (0xC6, 0x14, 0xD3), (0xC6, 0x67, 0xA1), (0xC6, 0x92, 0x22),
+    (0xC6, 0xF8, 0x4A), (0xC6, 0x0E, 0xBD), (0xC6, 0x42, 0xF6),
+    (0xC6, 0x48, 0xFD), (0xC6, 0x4E, 0xFF), (0xC6, 0x86, 0x30),
+    (0xC6, 0xC3, 0x74), (0xC6, 0x74, 0xC5), (0xC6, 0x52, 0xE7),
 )
 
 
@@ -664,21 +673,29 @@ class SpaClient:
         return f"{low:.0f}-{high:.1f}"
 
     def _seed_c6_buckets(self) -> None:
-        """Verteilt bekannte Seeds in passende Temperaturbereiche."""
-        # (code, temp_hint) – Live-Learn 18.5–22 und Mid-Range
+        """Verteilt Seeds nur in passende Buckets (kein Low-Code in High)."""
         seed_up = [
+            # low only
             ((0xC6, 0x7E, 0xDE), 19.5), ((0xC6, 0x24, 0x85), 20.0),
             ((0xC6, 0xB9, 0x1B), 20.5), ((0xC6, 0x8E, 0x2D), 21.0),
             ((0xC6, 0x9A, 0x3E), 21.5),
+            # mid
             ((0xC6, 0x68, 0xDF), 31.0), ((0xC6, 0xA7, 0x6F), 31.5),
             ((0xC6, 0x58, 0x91), 32.0), ((0xC6, 0xA6, 0x6C), 32.5),
             ((0xC6, 0x07, 0xCC), 33.0), ((0xC6, 0xF0, 0x3C), 33.5),
-            ((0xC6, 0x14, 0xD3), 39.0), ((0xC6, 0x67, 0xA1), 38.5),
+            # high 36.5–39.5
+            ((0xC6, 0x25, 0xE7), 36.5), ((0xC6, 0xC2, 0x01), 37.0),
+            ((0xC6, 0x51, 0x95), 37.5), ((0xC6, 0xD5, 0x10), 38.0),
+            ((0xC6, 0x67, 0xA1), 38.5), ((0xC6, 0x14, 0xD3), 39.0),
         ]
         seed_down = [
             ((0xC6, 0x66, 0xC7), 21.0), ((0xC6, 0x67, 0xC7), 20.5),
             ((0xC6, 0xF2, 0x5D), 20.0), ((0xC6, 0xDD, 0x73), 19.5),
             ((0xC6, 0x30, 0x9D), 19.0),
+            ((0xC6, 0x32, 0x81), 30.0), ((0xC6, 0xA8, 0x1A), 29.5),
+            ((0xC6, 0x1C, 0xAD), 29.0), ((0xC6, 0xCB, 0x7B), 28.5),
+            ((0xC6, 0xC5, 0x7A), 28.0),
+            ((0xC6, 0x93, 0x57), 38.5),
             ((0xC6, 0x92, 0x22), 28.5), ((0xC6, 0x4E, 0xFF), 29.0),
             ((0xC6, 0xF8, 0x4A), 29.5), ((0xC6, 0x0E, 0xBD), 30.0),
             ((0xC6, 0x42, 0xF6), 30.5), ((0xC6, 0x48, 0xFD), 31.0),
@@ -689,25 +706,24 @@ class SpaClient:
             if entry not in self._c6_buckets["up"][b]:
                 self._c6_buckets["up"][b].append(entry)
                 key = (1, b, entry[1], entry[2])
-                self._c6_bucket_score[key] = self._c6_bucket_score.get(key, 0) + 4
+                self._c6_bucket_score[key] = self._c6_bucket_score.get(key, 0) + 5
+            # High-Codes auch in Nachbar-High-Buckets
+            if temp >= 36.0:
+                for t2 in (36.0, 37.0, 38.0, 39.0):
+                    b2 = self._temp_bucket(t2)
+                    if entry not in self._c6_buckets["up"][b2]:
+                        self._c6_buckets["up"][b2].append(entry)
         for entry, temp in seed_down:
             b = self._temp_bucket(temp)
             if entry not in self._c6_buckets["down"][b]:
                 self._c6_buckets["down"][b].append(entry)
                 key = (0, b, entry[1], entry[2])
-                self._c6_bucket_score[key] = self._c6_bucket_score.get(key, 0) + 4
-        # UP-Seeds in höhere Buckets vorbefüllen
-        for entry in SEED_UP_C6:
-            for temp_hint in (23.0, 28.0, 34.0, 36.0, 37.5, 38.5):
-                b = self._temp_bucket(temp_hint)
-                if entry not in self._c6_buckets["up"][b]:
-                    self._c6_buckets["up"][b].append(entry)
-        # DOWN-Seeds in Low- und Mid-Buckets
-        for entry in SEED_DOWN_C6:
-            for temp_hint in (18.0, 22.0, 25.0, 28.0):
-                b = self._temp_bucket(temp_hint)
-                if entry not in self._c6_buckets["down"][b]:
-                    self._c6_buckets["down"][b].append(entry)
+                self._c6_bucket_score[key] = self._c6_bucket_score.get(key, 0) + 5
+            if 27.0 <= temp <= 31.0:
+                for t2 in (27.5, 28.5, 29.5, 30.5):
+                    b2 = self._temp_bucket(t2)
+                    if entry not in self._c6_buckets["down"][b2]:
+                        self._c6_buckets["down"][b2].append(entry)
 
     def _add_c6_to_bucket(
         self, warmer: bool, entry: tuple[int, int, int], temp: float, score_delta: int = 0
@@ -1648,12 +1664,43 @@ class SpaClient:
             self._c6_score = {}
 
         # ── Range/Unit-Sprung-Filter ─────────────────────────────────────
-        # Cameo 880: große Sprünge (33.5↔39.5) sind Decode-/Range-Artefakte.
-        # Logs 2026-08-16: Climb bis ~33 funktioniert, darüber Oszillation.
+        # Große Sprünge sind oft Dual-Soll (Low↔High). Wenn der neue Wert
+        # näher am Ziel liegt → als Fortschritt akzeptieren (nicht verwerfen).
         if abs(delta) >= TEMP_RANGE_JUMP_C:
+            anchor = self._temp_stable_anchor if self._temp_stable_anchor is not None else prev
+            err_cur = abs(current - self._target_temp)
+            err_prev = abs(prev - self._target_temp)
+            err_anchor = abs(anchor - self._target_temp)
+            closer = err_cur < err_prev - 0.4
+
+            if closer:
+                # Sprung Richtung Ziel (z.B. 22→30 bei Ziel 35) → übernehmen
+                self._temp_jump_streak = 0
+                self._temp_stall_rounds = 0
+                self._temp_stable_anchor = current
+                self._last_temp_seen = current
+                if (
+                    isinstance(code, tuple)
+                    and len(code) == 3
+                    and code[0] == 0xC6
+                ):
+                    self._temp_locked_code = None
+                    self._c6_score[code] = self._c6_score.get(code, 0) + 1
+                _LOGGER.warning(
+                    "Temp-Sprung Richtung Ziel akzeptiert: %.1f → %.1f "
+                    "(Ziel %.1f) code=%s",
+                    prev, current, self._target_temp, code,
+                )
+                if abs(current - self._target_temp) < 0.3:
+                    self._target_temp = NO_CHANGE_REQUESTED
+                    self._temp_done.set()
+                    return
+                self._temp_check = TEMP_STATUS_WAIT
+                await self._send_temp_step(self._target_temp > current)
+                return
+
             self._temp_jump_streak = getattr(self, "_temp_jump_streak", 0) + 1
             self._temp_stall_rounds = getattr(self, "_temp_stall_rounds", 0) + 1
-            # Lock sofort lösen – der Code hat den Sprung ausgelöst/verstärkt
             if (
                 isinstance(code, tuple)
                 and len(code) == 3
@@ -1661,20 +1708,12 @@ class SpaClient:
             ):
                 self._temp_locked_code = None
                 self._c6_score[code] = self._c6_score.get(code, 0) - 3
-                # Nicht in den Pool des Artefakt-Werts schreiben
             _LOGGER.warning(
                 "Temp-Feedback: großer Sprung ignoriert (Range/Unit-Artefakt, "
                 "keine Wertung) %.1f → %.1f Δ=%.1f code=%s streak=%d",
                 prev, current, delta, code, self._temp_jump_streak,
             )
-            # Wenn der Sprung vom Ziel WEG führt: Anker behalten, Reading verwerfen
-            anchor = self._temp_stable_anchor
-            if anchor is None:
-                anchor = prev
-            err_cur = abs(current - self._target_temp)
-            err_anchor = abs(anchor - self._target_temp)
             if err_cur > err_anchor + 0.4:
-                # Artefakt weiter weg vom Ziel → last_seen nicht auf Artefakt setzen
                 self._last_temp_seen = anchor
                 guide = anchor
             else:
