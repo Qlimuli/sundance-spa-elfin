@@ -308,8 +308,17 @@ TEMP_RANGE_HI_CC_BTN = 141
 TEMP_RANGE_HI_CC_B6  = 69
 BTN_MENU = 254
 
-# Seed aus Panel-Sniff 11:41 (frisch, Log-verifiziert)
+# Seeds: Panel-Sniff + LIVE-Learn 2026-08-17 (28.5→18.5 und Aufstieg).
+# WICHTIG: Jeder echte ±0.5-Schritt nutzt oft einen *anderen* C6-Code
+# (szenarienabhängig). Deshalb Pool rotieren, nicht einen Code hard-locken.
 SEED_DOWN_C6: list[tuple[int, int, int]] = [
+    # Low-Range 21→18.5 (Panel-Learn strong)
+    (0xC6, 0x66, 0xC7),  # 21.0→20.5
+    (0xC6, 0x67, 0xC7),  # 20.5→20.0
+    (0xC6, 0xF2, 0x5D),  # 20.0→19.5
+    (0xC6, 0xDD, 0x73),  # 19.5→19.0
+    (0xC6, 0x30, 0x9D),  # 19.0→18.5
+    # Mid-Range (älter, weiter nutzbar)
     (0xC6, 0x92, 0x22),  # 28.5→28.0
     (0xC6, 0x4E, 0xFF),  # 29.0→28.5
     (0xC6, 0xF8, 0x4A),  # 29.5→29.0
@@ -320,6 +329,13 @@ SEED_DOWN_C6: list[tuple[int, int, int]] = [
     (0xC6, 0xC3, 0x74),  # 32.0→31.5
 ]
 SEED_UP_C6: list[tuple[int, int, int]] = [
+    # Low-Range 19.5→22.0 (Panel-Learn strong)
+    (0xC6, 0x7E, 0xDE),  # 19.5→20.0
+    (0xC6, 0x24, 0x85),  # 20.0→20.5
+    (0xC6, 0xB9, 0x1B),  # 20.5→21.0
+    (0xC6, 0x8E, 0x2D),  # 21.0→21.5
+    (0xC6, 0x9A, 0x3E),  # 21.5→22.0
+    # Mid/High (älter)
     (0xC6, 0x68, 0xDF),  # 31.0→31.5
     (0xC6, 0xA7, 0x6F),  # 31.5→32.0
     (0xC6, 0x58, 0x91),  # 32.0→32.5
@@ -335,8 +351,8 @@ SEED_UP_C6: list[tuple[int, int, int]] = [
 TEMP_STALL_BEFORE_FALLBACK = 5
 TEMP_MAX_ATTEMPTS = 28
 TEMP_MAX_ATTEMPTS_HIGH = 48       # 34–40 °C: mehr C6-Versuche, CC hilft dort kaum
-TEMP_LEARN_POOL_MAX = 16
-TEMP_BUCKET_POOL_MAX = 12
+TEMP_LEARN_POOL_MAX = 24
+TEMP_BUCKET_POOL_MAX = 16
 TEMP_RANGE_JUMP_C = 2.5
 TEMP_LEARN_STRONG_DELTA = 0.5
 TEMP_LEARN_WEAK_DELTA = 1.0
@@ -367,19 +383,24 @@ TEMP_BUCKETS: tuple[tuple[float, float], ...] = (
     (38.5, 40.5),
 )
 
-# Synthetische Exploration-Kandidaten (Cameo C6 btn/b6), wenn Bucket leer ist.
-# Abgeleitet aus Log-Mustern (0x92/22, 0xF8/4A, 0x0E/BD, 0x68/DF, …) + Variationen.
+# Exploration-Kandidaten: frische Live-Learns zuerst, dann ältere Seeds.
 TEMP_EXPLORE_C6: tuple[tuple[int, int, int], ...] = (
+    # 2026-08-17 Low-Range live
+    (0xC6, 0x66, 0xC7), (0xC6, 0x67, 0xC7), (0xC6, 0xF2, 0x5D),
+    (0xC6, 0xDD, 0x73), (0xC6, 0x30, 0x9D), (0xC6, 0x7E, 0xDE),
+    (0xC6, 0x24, 0x85), (0xC6, 0xB9, 0x1B), (0xC6, 0x8E, 0x2D),
+    (0xC6, 0x9A, 0x3E),
+    # Mid-Range bekannt
     (0xC6, 0x92, 0x22), (0xC6, 0xF8, 0x4A), (0xC6, 0x0E, 0xBD),
     (0xC6, 0x42, 0xF6), (0xC6, 0x48, 0xFD), (0xC6, 0x4E, 0xFF),
     (0xC6, 0x86, 0x30), (0xC6, 0xC3, 0x74), (0xC6, 0x68, 0xDF),
     (0xC6, 0xA7, 0x6F), (0xC6, 0x58, 0x91), (0xC6, 0xA6, 0x6C),
     (0xC6, 0x07, 0xCC), (0xC6, 0xF0, 0x3C), (0xC6, 0x14, 0xD3),
     (0xC6, 0x67, 0xA1), (0xC6, 0xF0, 0x47), (0xC6, 0x52, 0xE7),
-    (0xC6, 0x74, 0xC5), (0xC6, 0x8E, 0x3C), (0xC6, 0x15, 0xA5),
-    (0xC6, 0xC8, 0x7C), (0xC6, 0x1A, 0xB0), (0xC6, 0x3D, 0xC1),
-    (0xC6, 0x5B, 0x88), (0xC6, 0x9C, 0x55), (0xC6, 0xB2, 0x19),
-    (0xC6, 0xD4, 0x2E), (0xC6, 0xE1, 0x0A), (0xC6, 0x2F, 0xD8),
+    (0xC6, 0x74, 0xC5), (0xC6, 0x15, 0xA5), (0xC6, 0xC8, 0x7C),
+    (0xC6, 0x1A, 0xB0), (0xC6, 0x3D, 0xC1), (0xC6, 0x5B, 0x88),
+    (0xC6, 0x9C, 0x55), (0xC6, 0xB2, 0x19), (0xC6, 0xD4, 0x2E),
+    (0xC6, 0xE1, 0x0A), (0xC6, 0x2F, 0xD8),
 )
 
 
@@ -644,29 +665,46 @@ class SpaClient:
 
     def _seed_c6_buckets(self) -> None:
         """Verteilt bekannte Seeds in passende Temperaturbereiche."""
-        seed_ranges_up = (31.0, 31.5, 32.0, 32.5, 33.0, 33.5, 39.0, 38.5)
-        seed_ranges_down = (28.5, 29.0, 29.5, 30.0, 30.5, 31.0, 31.5, 32.0)
-        for entry, temp in zip(SEED_UP_C6, seed_ranges_up):
+        # (code, temp_hint) – Live-Learn 18.5–22 und Mid-Range
+        seed_up = [
+            ((0xC6, 0x7E, 0xDE), 19.5), ((0xC6, 0x24, 0x85), 20.0),
+            ((0xC6, 0xB9, 0x1B), 20.5), ((0xC6, 0x8E, 0x2D), 21.0),
+            ((0xC6, 0x9A, 0x3E), 21.5),
+            ((0xC6, 0x68, 0xDF), 31.0), ((0xC6, 0xA7, 0x6F), 31.5),
+            ((0xC6, 0x58, 0x91), 32.0), ((0xC6, 0xA6, 0x6C), 32.5),
+            ((0xC6, 0x07, 0xCC), 33.0), ((0xC6, 0xF0, 0x3C), 33.5),
+            ((0xC6, 0x14, 0xD3), 39.0), ((0xC6, 0x67, 0xA1), 38.5),
+        ]
+        seed_down = [
+            ((0xC6, 0x66, 0xC7), 21.0), ((0xC6, 0x67, 0xC7), 20.5),
+            ((0xC6, 0xF2, 0x5D), 20.0), ((0xC6, 0xDD, 0x73), 19.5),
+            ((0xC6, 0x30, 0x9D), 19.0),
+            ((0xC6, 0x92, 0x22), 28.5), ((0xC6, 0x4E, 0xFF), 29.0),
+            ((0xC6, 0xF8, 0x4A), 29.5), ((0xC6, 0x0E, 0xBD), 30.0),
+            ((0xC6, 0x42, 0xF6), 30.5), ((0xC6, 0x48, 0xFD), 31.0),
+            ((0xC6, 0x86, 0x30), 31.5), ((0xC6, 0xC3, 0x74), 32.0),
+        ]
+        for entry, temp in seed_up:
             b = self._temp_bucket(temp)
             if entry not in self._c6_buckets["up"][b]:
                 self._c6_buckets["up"][b].append(entry)
                 key = (1, b, entry[1], entry[2])
-                self._c6_bucket_score[key] = self._c6_bucket_score.get(key, 0) + 2
-        for entry, temp in zip(SEED_DOWN_C6, seed_ranges_down):
+                self._c6_bucket_score[key] = self._c6_bucket_score.get(key, 0) + 4
+        for entry, temp in seed_down:
             b = self._temp_bucket(temp)
             if entry not in self._c6_buckets["down"][b]:
                 self._c6_buckets["down"][b].append(entry)
                 key = (0, b, entry[1], entry[2])
-                self._c6_bucket_score[key] = self._c6_bucket_score.get(key, 0) + 2
-        # UP-Seeds in 33–38.5-Buckets vorbefüllen (bisher nie erreicht)
+                self._c6_bucket_score[key] = self._c6_bucket_score.get(key, 0) + 4
+        # UP-Seeds in höhere Buckets vorbefüllen
         for entry in SEED_UP_C6:
-            for temp_hint in (34.0, 36.0, 37.5, 38.5):
+            for temp_hint in (23.0, 28.0, 34.0, 36.0, 37.5, 38.5):
                 b = self._temp_bucket(temp_hint)
                 if entry not in self._c6_buckets["up"][b]:
                     self._c6_buckets["up"][b].append(entry)
-        # DOWN-Seeds auch für Low-Range (16.5–26)
+        # DOWN-Seeds in Low- und Mid-Buckets
         for entry in SEED_DOWN_C6:
-            for temp_hint in (18.0, 22.0, 25.0):
+            for temp_hint in (18.0, 22.0, 25.0, 28.0):
                 b = self._temp_bucket(temp_hint)
                 if entry not in self._c6_buckets["down"][b]:
                     self._c6_buckets["down"][b].append(entry)
@@ -1331,8 +1369,8 @@ class SpaClient:
 
         self._c6_score[entry] = max(self._c6_score.get(entry, 0), 0) + score_delta
         self._c6_bucket_last_seen[(1 if direction else 0, bucket, btn, b6)] = now
-        if self._c6_score[entry] >= TEMP_STRONG_LOCK_SCORE:
-            self._temp_locked_code = entry
+        # Kein Hard-Lock: Live-Logs zeigen pro 0.5-Schritt oft *neuen* Code.
+        # Score priorisiert den Pool; Lock würde Folge-Schritte blockieren.
 
         _LOGGER.warning(
             "LEARN-%s C6 btn=0x%02X b6=0x%02X %.1f→%.1f Δ=%.1f "
@@ -1396,10 +1434,13 @@ class SpaClient:
             if lock_ok or scores.get(locked, 0) >= TEMP_STRONG_LOCK_SCORE:
                 candidates.append(locked)
 
+        session_used = getattr(self, "_temp_session_used", set()) or set()
         for bucket in bucket_order:
             pool = list(self._c6_buckets[direction][bucket])
+            # Frisch benutzte Codes nach hinten (Logs: jeder 0.5-Schritt oft neuer Code)
             pool.sort(
                 key=lambda c: (
+                    0 if c in session_used else 1,
                     self._c6_bucket_score.get(
                         (1 if warmer else 0, bucket, c[1], c[2]), 0
                     )
@@ -1418,7 +1459,7 @@ class SpaClient:
                 if scores.get(code, 0) < -5:
                     continue
                 candidates.append(code)
-                if len(candidates) >= 8:
+                if len(candidates) >= 10:
                     return candidates
 
         # Exploration: wenn wenig Kandidaten oder Stall → frische Codes
@@ -1727,14 +1768,19 @@ class SpaClient:
                     self._learned_c6_up = [c for c in self._learned_c6_up if c != code]
                     self._temp_blacklist_up.discard(code)
                     self._temp_blacklist_down.discard(code)
-                # STRONG-LOCK nur bei sauberem 0.5-Schritt
-                if (
-                    clean_step
-                    and self._c6_score[code] >= TEMP_STRONG_LOCK_SCORE
-                ):
-                    self._temp_locked_code = code
+                # Nach sauberem Schritt: Code als "gerade benutzt" markieren und
+                # Lock lösen. Live-Logs: Folge-Schritte brauchen oft *neuen* Code.
+                if clean_step:
+                    used = getattr(self, "_temp_session_used", None)
+                    if used is None:
+                        self._temp_session_used = set()
+                        used = self._temp_session_used
+                    used.add(code)
+                    if self._temp_locked_code == code:
+                        self._temp_locked_code = None
                     _LOGGER.warning(
-                        "Temp-C6 STRONG-LOCK code=%s bucket=%s score=%d Δ=%.1f",
+                        "Temp-C6 Schritt ok code=%s bucket=%s score=%d Δ=%.1f "
+                        "(Lock gelöst, nächster Code aus Pool)",
                         code, self._bucket_label(step_bucket),
                         self._c6_score[code], delta,
                     )
@@ -2104,6 +2150,7 @@ class SpaClient:
             self._temp_exploration_round = 0
             self._temp_jump_streak = 0
             self._temp_range_forced = False
+            self._temp_session_used = set()
             self._temp_target_bucket = self._temp_bucket(target)
             self._temp_current_bucket = self._temp_bucket(float(snap["set_temp"]))
             self._temp_stable_anchor = float(snap["set_temp"])
