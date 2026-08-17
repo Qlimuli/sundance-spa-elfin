@@ -334,7 +334,7 @@ SEED_UP_C6: list[tuple[int, int, int]] = [
 # Direct-Set 0x20 oft ignoriert → C6 primär, CC Fallback, 0x20 selten.
 TEMP_STALL_BEFORE_FALLBACK = 5
 TEMP_MAX_ATTEMPTS = 28
-TEMP_MAX_ATTEMPTS_HIGH = 42       # High-Range: mehr Exploration statt denselben Code zu hämmern
+TEMP_MAX_ATTEMPTS_HIGH = 48       # 34–40 °C: mehr C6-Versuche, CC hilft dort kaum
 TEMP_LEARN_POOL_MAX = 16
 TEMP_BUCKET_POOL_MAX = 12
 TEMP_RANGE_JUMP_C = 2.5
@@ -345,20 +345,26 @@ TEMP_STRONG_LOCK_SCORE = 12
 TEMP_FLOOR_PROBE = 4
 TEMP_STATUS_WAIT = 5              # Status-Frames warten nach TX (~1–1.5s)
 TEMP_MIN_STEP_GAP = 0.9           # min. Sekunden zwischen Temp-Befehlen
-TEMP_SPA_FLOOR_C = 28.0           # typisches Cameo-Minimum (High-Range)
+TEMP_SPA_FLOOR_C = 16.5           # absolutes Cameo-Minimum (Low-Range)
+TEMP_SPA_HIGH_FLOOR_C = 26.5      # typisches High-Range-Minimum
 TEMP_CLEAN_STEP_MAX = 0.6         # nur ±0.5-Schritte dürfen STRONG-LOCK auslösen
 TEMP_JUMP_UNLOCK = 1.2            # bei Δ≥1.2°C Lock sofort lösen (kein echter Schritt)
 TEMP_OSCILLATION_LIMIT = 3        # Range-Sprünge hintereinander → aggressiv entsperren
+TEMP_MIN_C = 16.5
+TEMP_MAX_C = 40.0
+# Ab diesem Ziel High-Range erzwingen (Logs: 34–38.5 nie ohne High-Range)
+TEMP_HIGH_RANGE_FROM = 33.0
 
-# Temperaturabhängige C6-Lernbereiche. Der Pool ist absichtlich nicht global:
-# Codes aus dem 28-32°C-Bereich sollen bei 36-39°C nicht mehr bevorzugt werden.
+# Temperaturabhängige C6-Lernbereiche. Der Pool ist absichtlich nicht global.
 # WICHTIG: Ein Temp-Schritt passiert IMMER am aktuellen Wert (±0.5), nie am Ziel.
-# Deshalb primär current_bucket wählen, nicht target_bucket.
 TEMP_BUCKETS: tuple[tuple[float, float], ...] = (
-    (26.0, 29.0),
+    (16.5, 22.0),   # Low-Range unten
+    (22.0, 26.5),   # Low-Range oben / High-Floor
+    (26.5, 29.0),
     (29.0, 33.0),
-    (33.0, 37.0),
-    (37.0, 40.5),
+    (33.0, 36.0),   # problematisch ohne High-Range
+    (36.0, 38.5),   # bisher nie erreicht
+    (38.5, 40.5),
 )
 
 # Synthetische Exploration-Kandidaten (Cameo C6 btn/b6), wenn Bucket leer ist.
@@ -381,7 +387,8 @@ TEMP_EXPLORE_C6: tuple[tuple[int, int, int], ...] = (
 def _build_set_temp(channel: int, celsius: float) -> bytes:
     """Direkt-Solltemperatur (Msg 0x20). Wert = °C × 2 (halbe Grad)."""
     val = int(round(celsius * 2.0))
-    val = max(40, min(80, val))  # 20.0 … 40.0 °C
+    # 16.5 … 40.0 °C → raw 33 … 80
+    val = max(33, min(80, val))
     ml = 6
     msg = bytearray(8)
     msg[0] = M_STARTEND
@@ -636,11 +643,7 @@ class SpaClient:
         return f"{low:.0f}-{high:.1f}"
 
     def _seed_c6_buckets(self) -> None:
-        """Verteilt bekannte Seeds in passende Temperaturbereiche.
-
-        DOWN-Seeds stammen aus Logs um 28–32 °C. UP-Seeds decken 31–34 und
-        38–39 ab. Für 33–37 fehlen oft Codes → Exploration füllt nach.
-        """
+        """Verteilt bekannte Seeds in passende Temperaturbereiche."""
         seed_ranges_up = (31.0, 31.5, 32.0, 32.5, 33.0, 33.5, 39.0, 38.5)
         seed_ranges_down = (28.5, 29.0, 29.5, 30.0, 30.5, 31.0, 31.5, 32.0)
         for entry, temp in zip(SEED_UP_C6, seed_ranges_up):
@@ -655,11 +658,18 @@ class SpaClient:
                 self._c6_buckets["down"][b].append(entry)
                 key = (0, b, entry[1], entry[2])
                 self._c6_bucket_score[key] = self._c6_bucket_score.get(key, 0) + 2
-        # UP-Seeds zusätzlich in Nachbar-Buckets legen, damit 33–37 nicht leer startet
-        for entry in SEED_UP_C6[:6]:
-            for b in (1, 2):  # 29–33 und 33–37
+        # UP-Seeds in 33–38.5-Buckets vorbefüllen (bisher nie erreicht)
+        for entry in SEED_UP_C6:
+            for temp_hint in (34.0, 36.0, 37.5, 38.5):
+                b = self._temp_bucket(temp_hint)
                 if entry not in self._c6_buckets["up"][b]:
                     self._c6_buckets["up"][b].append(entry)
+        # DOWN-Seeds auch für Low-Range (16.5–26)
+        for entry in SEED_DOWN_C6:
+            for temp_hint in (18.0, 22.0, 25.0):
+                b = self._temp_bucket(temp_hint)
+                if entry not in self._c6_buckets["down"][b]:
+                    self._c6_buckets["down"][b].append(entry)
 
     def _add_c6_to_bucket(
         self, warmer: bool, entry: tuple[int, int, int], temp: float, score_delta: int = 0
@@ -710,7 +720,10 @@ class SpaClient:
 
     def _adaptive_temp_attempts(self, target: float | None = None) -> int:
         target = self._target_temp if target is None else target
-        if target is not None and target >= 33.0:
+        if target is None:
+            return TEMP_MAX_ATTEMPTS
+        # Langer Weg (16.5↔40) und High-Range 34–38.5 brauchen mehr Versuche
+        if target >= TEMP_HIGH_RANGE_FROM or target <= 22.0:
             return TEMP_MAX_ATTEMPTS_HIGH
         return TEMP_MAX_ATTEMPTS
 
@@ -1466,9 +1479,16 @@ class SpaClient:
         await self._wait_pending_clear(timeout=PENDING_WAIT_S)
 
         stall = getattr(self, "_temp_stall_rounds", 0)
-        # CC ab stall≥5, Direct nur sehr spät und selten
-        use_cc = stall >= TEMP_STALL_BEFORE_FALLBACK and (stall % 3 != 0)
-        use_direct = stall >= TEMP_STALL_BEFORE_FALLBACK * 3 and (stall % 5 == 0)
+        # Im High-Bereich 34–38.5: CC/Direct helfen kaum → C6 länger priorisieren
+        tgt = self._target_temp
+        high_climb = (
+            isinstance(tgt, (int, float))
+            and tgt >= TEMP_HIGH_RANGE_FROM
+            and tgt != NO_CHANGE_REQUESTED
+        )
+        stall_cc = TEMP_STALL_BEFORE_FALLBACK + (4 if high_climb else 0)
+        use_cc = stall >= stall_cc and (stall % 3 != 0)
+        use_direct = stall >= stall_cc * 3 and (stall % 5 == 0)
 
         if use_direct:
             await self._try_direct_set(self._target_temp)
@@ -1637,7 +1657,7 @@ class SpaClient:
             # dann Code aus Anker-Bucket entfernen.
             if self._temp_jump_streak >= TEMP_OSCILLATION_LIMIT:
                 if (
-                    self._target_temp >= 33.5
+                    self._target_temp >= TEMP_HIGH_RANGE_FROM
                     and not getattr(self, "_temp_range_forced", False)
                 ):
                     _LOGGER.warning(
@@ -1998,18 +2018,11 @@ class SpaClient:
         return CMD_CHANNEL
 
     async def _force_temp_range_high(self) -> None:
-        """High-Range erzwingen – Logs: über ~33–34°C sonst 34↔28.5-Oszillation.
-
-        Cameo speichert Low- und High-Range-Soll getrennt. Ohne High-Range
-        enden UP-Schritte an der Low-Range-Grenze und springen auf den
-        Low-Sollwert (~28.5) zurück. Deshalb vor Zielen ≥33.5 und bei
-        erkannter Oszillation explizit RANGE HI senden.
-        """
+        """High-Range erzwingen – ohne sie endet UP bei ~33–34 (34↔28.5)."""
         _LOGGER.warning(
-            "Temp-Range → HIGH (CC %d / alt %d) – Ziel über Low-Range-Grenze",
+            "Temp-Range → HIGH (CC %d / alt %d)",
             BTN_TEMP_RANGE_HI, TEMP_RANGE_HI_CC_BTN,
         )
-        # Zwei Varianten: klassischer Button + Cameo-CC-Variante aus dem Code
         await self._queue_cc(BTN_TEMP_RANGE_HI)
         await self._wait_pending_clear(timeout=2.0)
         await asyncio.sleep(0.4)
@@ -2019,15 +2032,26 @@ class SpaClient:
         self._temp_jump_streak = 0
         self._temp_range_forced = True
 
+    async def _force_temp_range_low(self) -> None:
+        """Low-Range erzwingen – nötig für Sollwerte unter ~26.5 bis 16.5 °C."""
+        _LOGGER.warning("Temp-Range → LOW (CC %d)", BTN_TEMP_RANGE_LOW)
+        await self._queue_cc(BTN_TEMP_RANGE_LOW)
+        await self._wait_pending_clear(timeout=2.0)
+        await asyncio.sleep(0.6)
+        self._temp_jump_streak = 0
+        self._temp_range_forced = True
+
     async def _ensure_temp_range(self, target: float, snap: dict | None = None) -> None:
-        """High-Range anfordern wenn Ziel über der typischen Low-Range-Grenze liegt."""
-        if target < 33.5:
-            return
+        """Passende Range vor dem Stepping setzen (High ab 33, Low unter 26.5)."""
         if getattr(self, "_temp_range_forced", False):
             return
-        await self._force_temp_range_high()
+        if target >= TEMP_HIGH_RANGE_FROM:
+            await self._force_temp_range_high()
+        elif target < TEMP_SPA_HIGH_FLOOR_C:
+            await self._force_temp_range_low()
+        else:
+            return
         if snap:
-            # Anker nach Range-Switch neu setzen
             st = snap.get("set_temp")
             if st is not None:
                 self._temp_stable_anchor = float(st)
@@ -2051,7 +2075,7 @@ class SpaClient:
 
     async def set_temperature(self, target: float) -> None:
         """Solltemperatur steuern: C6-Learn → Klartext-CC → Direct-Set."""
-        target = max(20.0, min(40.0, round(target * 2) / 2.0))
+        target = max(TEMP_MIN_C, min(TEMP_MAX_C, round(target * 2) / 2.0))
         async with self._cmd_lock:
             self._target_temp = NO_CHANGE_REQUESTED
             self._temp_done.set()
@@ -2097,11 +2121,17 @@ class SpaClient:
             for k in stale[:4]:
                 self._c6_bucket_blacklist.discard(k)
             # Beim Hochlaufen: bewährte Low-Range-UP-Codes in current+next legen
-            if warmer and float(snap["set_temp"]) < 33.5:
-                for entry in list(self._learned_c6_up)[-6:]:
+            if warmer:
+                for entry in list(self._learned_c6_up)[-8:]:
                     self._add_c6_to_bucket(True, entry, float(snap["set_temp"]), 0)
                     self._add_c6_to_bucket(
-                        True, entry, min(target, float(snap["set_temp"]) + 2.0), 0
+                        True, entry, min(target, float(snap["set_temp"]) + 3.0), 0
+                    )
+            elif not warmer and target <= 22.0:
+                for entry in list(self._learned_c6_down)[-8:]:
+                    self._add_c6_to_bucket(False, entry, float(snap["set_temp"]), 0)
+                    self._add_c6_to_bucket(
+                        False, entry, max(target, float(snap["set_temp"]) - 3.0), 0
                     )
             self._last_temp_seen = float(snap["set_temp"])
             self._debug_cmd = True
