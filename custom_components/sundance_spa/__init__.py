@@ -367,7 +367,7 @@ TEMP_EXPLORATION_AFTER = 3         # nach N erfolglosen C6-Versuchen gezielt neu
 TEMP_STRONG_LOCK_SCORE = 12
 TEMP_FLOOR_PROBE = 4
 TEMP_STATUS_WAIT = 5              # Status-Frames warten nach TX (~1–1.5s)
-TEMP_MIN_STEP_GAP = 0.9           # min. Sekunden zwischen Temp-Befehlen
+TEMP_MIN_STEP_GAP = 1.2           # min. Sekunden zwischen Temp-Befehlen (weniger Spam)
 TEMP_SPA_FLOOR_C = 16.5           # absolutes Cameo-Minimum (Low-Range)
 TEMP_SPA_HIGH_FLOOR_C = 26.5      # typisches High-Range-Minimum
 TEMP_CLEAN_STEP_MAX = 0.6         # nur ±0.5-Schritte dürfen STRONG-LOCK auslösen
@@ -645,6 +645,7 @@ class SpaClient:
         self._temp_jump_streak = 0  # aufeinanderfolgende Range/Unit-Sprünge
         self._temp_stable_anchor: float | None = None  # letzter „sauberer“ Sollwert
         self._temp_range_forced = False  # High-Range in diesem set_temperature schon gesendet
+        self._set_temp_hist: list[tuple[float, float]] = []  # (ts, set_temp) für Stabilisierung
         self._sniff_panel_cc = True
         self._last_logged_display: int | None = None
         self._last_logged_set: float | None = None
@@ -1100,7 +1101,12 @@ class SpaClient:
                             )
                     self._last_status = dec
                     if dec.get("set_temp") is not None:
-                        self._learn_c6_from_settemp(float(dec["set_temp"]))
+                        st = float(dec["set_temp"])
+                        now_ts = time.monotonic()
+                        self._set_temp_hist.append((now_ts, st))
+                        if len(self._set_temp_hist) > 40:
+                            self._set_temp_hist = self._set_temp_hist[-30:]
+                        self._learn_c6_from_settemp(st)
                     await self._handle_temp_feedback(dec)
 
             elif mtype in (LIGHTS_UPDATE, LIGHTS_UPDATE_ALT):
@@ -1434,23 +1440,27 @@ class SpaClient:
             bucket_order.append(other)
 
         candidates: list[tuple[int, int, int]] = []
-        locked = getattr(self, "_temp_locked_code", None)
-        if (
-            locked
-            and isinstance(locked, tuple)
-            and len(locked) == 3
-            and locked[0] == 0xC6
-            and locked not in bl
-            and not self._is_bucket_blacklisted(warmer, locked, current_bucket)
-        ):
-            lock_ok = any(
-                locked in self._c6_buckets[direction][b]
-                for b in bucket_order[:2]
-            )
-            if lock_ok or scores.get(locked, 0) >= TEMP_STRONG_LOCK_SCORE:
-                candidates.append(locked)
-
         session_used = getattr(self, "_temp_session_used", set()) or set()
+
+        # Frische Panel-Sniffs (letzte 90s) in passender Richtung zuerst –
+        # das sind die einzigen Codes, die in dieser Session bewiesen sind.
+        now = time.monotonic()
+        for item in reversed(list(getattr(self, "_panel_c6_recent", []))):
+            if len(item) < 3:
+                continue
+            ts, btn, b6 = item[0], item[1], item[2]
+            if now - ts > 90.0:
+                break
+            entry = (0xC6, btn, b6)
+            if entry in candidates or entry in bl or entry in session_used:
+                continue
+            if scores.get(entry, 0) < -3:
+                continue
+            # Nur wenn Score positiv (LEARN-UP/DOWN in dieser Session) oder ganz frisch
+            if scores.get(entry, 0) > 0 or now - ts < 30.0:
+                candidates.append(entry)
+            if len(candidates) >= 4:
+                break
         for bucket in bucket_order:
             pool = list(self._c6_buckets[direction][bucket])
             # Frisch benutzte Codes nach hinten (Logs: jeder 0.5-Schritt oft neuer Code)
@@ -1536,16 +1546,10 @@ class SpaClient:
         await self._wait_pending_clear(timeout=PENDING_WAIT_S)
 
         stall = getattr(self, "_temp_stall_rounds", 0)
-        # Im High-Bereich 34–38.5: CC/Direct helfen kaum → C6 länger priorisieren
-        tgt = self._target_temp
-        high_climb = (
-            isinstance(tgt, (int, float))
-            and tgt >= TEMP_HIGH_RANGE_FROM
-            and tgt != NO_CHANGE_REQUESTED
-        )
-        stall_cc = TEMP_STALL_BEFORE_FALLBACK + (4 if high_climb else 0)
-        use_cc = stall >= stall_cc and (stall % 3 != 0)
-        use_direct = stall >= stall_cc * 3 and (stall % 5 == 0)
+        # CC/Direct oft nutzlos oder schädlich (Dual-Soll) → sehr spät, selten
+        stall_cc = TEMP_STALL_BEFORE_FALLBACK + 8
+        use_cc = stall >= stall_cc and (stall % 5 == 0)
+        use_direct = False  # 0x20 wird vom Cameo-Board ignoriert
 
         if use_direct:
             await self._try_direct_set(self._target_temp)
@@ -1636,7 +1640,9 @@ class SpaClient:
             self._temp_check -= 1
             return
 
-        current = float(status["set_temp"])
+        # Rohwert + stabilisierter Modalwert (gegen 20↔28-Flackern)
+        raw_current = float(status["set_temp"])
+        current = self._stable_set_temp(raw_current) or raw_current
         if abs(current - self._target_temp) < 0.3:
             _LOGGER.warning(
                 "Soll-Temperatur erreicht: %.1f °C attempts=%d locked=%s",
@@ -1664,32 +1670,21 @@ class SpaClient:
             self._c6_score = {}
 
         # ── Range/Unit-Sprung-Filter ─────────────────────────────────────
-        # Große Sprünge sind oft Dual-Soll (Low↔High). Wenn der neue Wert
-        # näher am Ziel liegt → als Fortschritt akzeptieren (nicht verwerfen).
+        # Große Sprünge = Dual-Soll-Flackern. Nur akzeptieren wenn der neue
+        # Wert *sehr nah am Ziel* landet (±1.0). Sonst Anker behalten.
         if abs(delta) >= TEMP_RANGE_JUMP_C:
             anchor = self._temp_stable_anchor if self._temp_stable_anchor is not None else prev
             err_cur = abs(current - self._target_temp)
-            err_prev = abs(prev - self._target_temp)
-            err_anchor = abs(anchor - self._target_temp)
-            closer = err_cur < err_prev - 0.4
+            near_target = err_cur <= 1.0
 
-            if closer:
-                # Sprung Richtung Ziel (z.B. 22→30 bei Ziel 35) → übernehmen
+            if near_target:
                 self._temp_jump_streak = 0
                 self._temp_stall_rounds = 0
                 self._temp_stable_anchor = current
                 self._last_temp_seen = current
-                if (
-                    isinstance(code, tuple)
-                    and len(code) == 3
-                    and code[0] == 0xC6
-                ):
-                    self._temp_locked_code = None
-                    self._c6_score[code] = self._c6_score.get(code, 0) + 1
                 _LOGGER.warning(
-                    "Temp-Sprung Richtung Ziel akzeptiert: %.1f → %.1f "
-                    "(Ziel %.1f) code=%s",
-                    prev, current, self._target_temp, code,
+                    "Temp-Sprung nah am Ziel akzeptiert: %.1f → %.1f (Ziel %.1f)",
+                    prev, current, self._target_temp,
                 )
                 if abs(current - self._target_temp) < 0.3:
                     self._target_temp = NO_CHANGE_REQUESTED
@@ -1707,18 +1702,15 @@ class SpaClient:
                 and code[0] == 0xC6
             ):
                 self._temp_locked_code = None
-                self._c6_score[code] = self._c6_score.get(code, 0) - 3
+                self._c6_score[code] = self._c6_score.get(code, 0) - 4
             _LOGGER.warning(
-                "Temp-Feedback: großer Sprung ignoriert (Range/Unit-Artefakt, "
-                "keine Wertung) %.1f → %.1f Δ=%.1f code=%s streak=%d",
-                prev, current, delta, code, self._temp_jump_streak,
+                "Temp-Feedback: großer Sprung ignoriert (Dual-Soll) "
+                "%.1f → %.1f (raw %.1f) Δ=%.1f code=%s streak=%d",
+                prev, current, raw_current, delta, code, self._temp_jump_streak,
             )
-            if err_cur > err_anchor + 0.4:
-                self._last_temp_seen = anchor
-                guide = anchor
-            else:
-                self._last_temp_seen = current
-                guide = current
+            # Immer Anker behalten – nicht dem Flackern hinterherlaufen
+            self._last_temp_seen = anchor
+            guide = anchor
             if abs(guide - self._target_temp) < 0.3:
                 self._target_temp = NO_CHANGE_REQUESTED
                 self._temp_done.set()
@@ -1733,21 +1725,8 @@ class SpaClient:
                     self._pending.clear()
                 self._temp_done.set()
                 return
-            # Nach mehreren Oszillationen: erst Range-HI versuchen (34↔28.5-Muster),
-            # dann Code aus Anker-Bucket entfernen.
+            # Bei Oszillation: Pause + stabilen Wert abwarten, kein Code-Spam
             if self._temp_jump_streak >= TEMP_OSCILLATION_LIMIT:
-                if (
-                    self._target_temp >= TEMP_HIGH_RANGE_FROM
-                    and not getattr(self, "_temp_range_forced", False)
-                ):
-                    _LOGGER.warning(
-                        "Temp-Oszillation streak=%d bei Ziel=%.1f → High-Range erzwingen",
-                        self._temp_jump_streak, self._target_temp,
-                    )
-                    await self._force_temp_range_high()
-                    self._temp_check = TEMP_STATUS_WAIT
-                    await self._send_temp_step(self._target_temp > guide)
-                    return
                 if (
                     isinstance(code, tuple)
                     and len(code) == 3
@@ -1756,10 +1735,22 @@ class SpaClient:
                     wanted_up = self._target_temp > guide
                     self._remove_c6_from_bucket(wanted_up, code, anchor)
                     _LOGGER.warning(
-                        "Temp-Oszillation: code=%s aus Bucket %s entfernt",
+                        "Temp-Oszillation: code=%s aus Bucket %s entfernt, "
+                        "Pause 1.5s für stabilen Status",
                         code, self._bucket_label(self._temp_bucket(anchor)),
                     )
                 self._temp_jump_streak = 0
+                self._temp_check = TEMP_STATUS_WAIT + 4
+                await asyncio.sleep(1.5)
+                stable = self._stable_set_temp(guide)
+                if stable is not None:
+                    self._last_temp_seen = stable
+                    self._temp_stable_anchor = stable
+                    guide = stable
+                if abs(guide - self._target_temp) < 0.3:
+                    self._target_temp = NO_CHANGE_REQUESTED
+                    self._temp_done.set()
+                    return
             self._temp_check = TEMP_STATUS_WAIT
             await self._send_temp_step(self._target_temp > guide)
             return
@@ -2126,21 +2117,39 @@ class SpaClient:
         self._temp_jump_streak = 0
         self._temp_range_forced = True
 
+    def _stable_set_temp(self, fallback: float | None = None) -> float | None:
+        """Stabiler Sollwert aus den letzten Status-Frames.
+
+        Cameo flackert oft zwischen Low- und High-Soll (z.B. 20↔28).
+        Wir nehmen den Modalwert der letzten ~2.5s; bei Gleichstand den
+        Wert näher am Anker / Fallback.
+        """
+        now = time.monotonic()
+        recent = [v for ts, v in self._set_temp_hist if now - ts <= 2.5]
+        if not recent:
+            return fallback
+        # Häufigkeit
+        counts: dict[float, int] = {}
+        for v in recent:
+            counts[v] = counts.get(v, 0) + 1
+        # sortiert nach Häufigkeit, dann Nähe zu fallback/anchor
+        anchor = self._temp_stable_anchor
+        ref = anchor if anchor is not None else fallback
+        def key(item: tuple[float, int]) -> tuple:
+            v, c = item
+            dist = abs(v - ref) if ref is not None else 0.0
+            return (-c, dist)
+        best = sorted(counts.items(), key=key)[0][0]
+        return best
+
     async def _ensure_temp_range(self, target: float, snap: dict | None = None) -> None:
-        """Passende Range vor dem Stepping setzen (High ab 33, Low unter 26.5)."""
-        if getattr(self, "_temp_range_forced", False):
-            return
-        if target >= TEMP_HIGH_RANGE_FROM:
-            await self._force_temp_range_high()
-        elif target < TEMP_SPA_HIGH_FLOOR_C:
-            await self._force_temp_range_low()
-        else:
-            return
-        if snap:
-            st = snap.get("set_temp")
-            if st is not None:
-                self._temp_stable_anchor = float(st)
-                self._last_temp_seen = float(st)
+        """Range-Umschaltung via CC 200/201 deaktiviert.
+
+        Logs: LOW/HIGH-CC erzeugen Dual-Soll-Flackern (20↔28, 28↔33) und
+        machen C6-Stepping unbrauchbar. Range nur manuell am Panel oder
+        wenn wir den echten C6-Range-Code gesnifft haben.
+        """
+        return
 
     async def _ensure_pumps_off_for_heating(self) -> None:
         """Cameo 880 (40A): Temperaturänderung nur bei ausgeschalteten Jet-Pumpen."""
