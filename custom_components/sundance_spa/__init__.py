@@ -222,27 +222,46 @@ def _build_c6_encrypted(
     return bytes(msg)
 
 
+def _balboa_crc8(data: bytes | bytearray | list[int]) -> int:
+    """Balboa CRC-8 (init=0x02, poly=0x07, xorout=0x02, no reflection).
+
+    Liefert dieselben Werte wie _calc_cs für unsere Frames; explizit für
+    C7-Synthese dokumentiert (Claude/Panel-Sniff 2026-08-18, 11/11).
+    """
+    crc = 0x02
+    for byte in data:
+        crc ^= int(byte) & 0xFF
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ 0x07) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+    return crc ^ 0x02
+
+
 def _build_c7(
     btn: int = LIGHT_C7_BTN,
     b6: int = LIGHT_C7_B6,
     channel: int = CMD_CHANNEL,
     key_byte: int = 0,
 ) -> bytes:
-    """Cameo Licht-Befehl 0xC7 (verschlüsselt, Panel-Sniff: Klartext 0x2F/0x33)."""
-    ml = 8
-    msg = bytearray(10)
-    msg[0] = M_STARTEND
-    msg[1] = ml
-    msg[2] = channel & 0xFF
-    msg[3] = 0xBF
-    msg[4] = C7_REQ
-    msg[5] = key_byte & 0xFF
-    msg[6] = btn & 0xFF
-    msg[7] = b6 & 0xFF
-    msg[8] = 0
-    msg[9] = M_STARTEND
-    msg = _jacuzzi_xor_cipher(msg, encrypt=True)
-    return bytes(msg)
+    """Cameo Licht C7 – Klartext immer 0x2F/0x33, key_byte frei (Nonce).
+
+    Panel-Sniff: jeder Tastendruck decryptet zu 2F/33; key wechselt nur.
+    Cipher self-describing: key1 = key_byte ^ 0xC7.
+    """
+    msgtype = C7_REQ
+    length = 0x08
+    key_byte = key_byte & 0xFF
+    key1 = key_byte ^ msgtype
+    key2 = (length - 5 - 2) % 64
+    enc: list[int] = []
+    for p in (btn & 0xFF, b6 & 0xFF):
+        key2 = (key2 - 1) % 64
+        enc.append(p ^ (key1 ^ key2))
+    body = [length, channel & 0xFF, 0xBF, msgtype, key_byte] + enc
+    cs = _balboa_crc8(body)
+    return bytes([M_STARTEND] + body + [cs, M_STARTEND])
 
 def _xormsg(data: bytes | bytearray) -> list[int]:
     result = []
@@ -2031,16 +2050,12 @@ class SpaClient:
 
 
     async def _send_light_step(self, color: bool = False) -> None:
-        """Licht-Schritt einreihen (nicht blockieren).
+        """Ein Licht-Zyklus-Schritt (C7 Klartext 0x2F/0x33, key frei).
 
-        C7 vom Panel funktioniert, von uns trotz CTS nicht.
-        Deshalb mehrere Varianten testen:
-          0-3:   C7 encrypted (Panel-Format)
-          4-6:   CC Klartext 0x2F/0x33
-          7-9:   CC Klartext 241 (Balboa Standard)
-          10-12: encrypted CC 0x2F/0x33
+        Panel-Taste = Cycle 100→80→60→40→20→0→…; kein Absolut-Set.
+        key_byte ist Nonce (self-describing cipher), beliebig wählbar.
         """
-        if self._light_attempt >= 14:
+        if self._light_attempt >= 24:
             if not getattr(self, "_light_exhausted_logged", False):
                 _LOGGER.error("Licht-Versuche erschöpft – Abbruch")
                 self._light_exhausted_logged = True
@@ -2051,38 +2066,29 @@ class SpaClient:
             self._light_done.set()
             return
 
-        async with self._pending_lock:
-            if self._pending:
-                return
-
         self._assigned_channel = CMD_CHANNEL
         attempt = self._light_attempt
         ch = CMD_CHANNEL
 
         if color:
-            _LOGGER.warning("Licht COLOR CC-F2 attempt=%d", attempt + 1)
-            await self._queue_cc(0xF2, CC_REQ, 0x00)
-        elif attempt < 4:
-            key_byte = ((attempt + 1) * 0x17 + 0x04) & 0xFF
+            # Farbe/Modus: CC 0xF2 (Balboa light-color) + C7-Cycle als Fallback
+            if attempt % 2 == 0:
+                _LOGGER.warning("Licht COLOR CC-F2 attempt=%d", attempt + 1)
+                await self._queue_cc(0xF2, CC_REQ, 0x00)
+            else:
+                key_byte = (0x17 + attempt * 0x29) & 0xFF
+                pkt = _build_c7(LIGHT_C7_BTN, LIGHT_C7_B6, ch, key_byte=key_byte)
+                _LOGGER.warning(
+                    "Licht C7-CYCLE (color-fallback) key=0x%02X attempt=%d pkt=%s",
+                    key_byte, attempt + 1, pkt.hex(" "),
+                )
+                await self._queue_raw(pkt)
+        else:
+            # Primär: panel-identisches C7, key rotiert
+            key_byte = (0x17 + attempt * 0x29) & 0xFF
             pkt = _build_c7(LIGHT_C7_BTN, LIGHT_C7_B6, ch, key_byte=key_byte)
             _LOGGER.warning(
-                "Licht C7-ENC key=0x%02X attempt=%d pkt=%s",
-                key_byte, attempt + 1, pkt.hex(" "),
-            )
-            await self._queue_raw(pkt)
-        elif attempt < 7:
-            _LOGGER.warning("Licht CC-2F33 attempt=%d", attempt + 1)
-            await self._queue_cc(LIGHT_C7_BTN, CC_REQ, LIGHT_C7_B6)
-        elif attempt < 10:
-            _LOGGER.warning("Licht CC-241 attempt=%d", attempt + 1)
-            await self._queue_cc(BTN_LIGHT, CC_REQ, 0)
-        else:
-            key_byte = ((attempt + 1) * 0x13) & 0xFF
-            pkt = _build_cc_encrypted(
-                LIGHT_C7_BTN, ch, CC_REQ, LIGHT_C7_B6, key_byte=key_byte
-            )
-            _LOGGER.warning(
-                "Licht CC-ENC 2F/33 key=0x%02X attempt=%d pkt=%s",
+                "Licht C7-CYCLE key=0x%02X attempt=%d pkt=%s",
                 key_byte, attempt + 1, pkt.hex(" "),
             )
             await self._queue_raw(pkt)
@@ -2436,31 +2442,39 @@ class SpaClient:
             else:
                 return
 
-            # Aktive Steuerung hier (nicht im Receiver): einreihen → CTS abwarten → Status prüfen
+            # Cameo: C7 = Cycle-Taste (100→80→60→40→20→0→100…).
+            # Schritte berechnen, nach jedem Press CA abwarten.
+            BRIGHT_CYCLE = [100, 80, 60, 40, 20, 0]
             tgt = self._target_light_brightness
             mode_tgt = self._target_light_mode
-            deadline = time.monotonic() + 45.0
+            deadline = time.monotonic() + 50.0
+            last_cur = None
+            stagnant = 0
             while time.monotonic() < deadline:
                 lights = await self._lights_snapshot()
                 if not lights:
                     await self._send_light_step(color=False)
                     await self._wait_pending_clear(timeout=2.5)
-                    await asyncio.sleep(0.6)
+                    await asyncio.sleep(0.8)
                     continue
 
+                # brightness_raw ist bei Cameo bereits die Stufe 0/20/…/100
                 cur = int(lights.get("brightness_raw") or 0)
+                # auf nächste bekannte Stufe snappen
+                if cur not in BRIGHT_CYCLE:
+                    cur = min(BRIGHT_CYCLE, key=lambda s: abs(s - cur))
+
                 if mode_tgt != LIGHT_NO_CHANGE:
                     if lights.get("mode_raw") == mode_tgt:
                         self._target_light_mode = LIGHT_NO_CHANGE
                         self._light_done.set()
                         break
-                    # ggf. erst einschalten
                     if cur == 0:
                         await self._send_light_step(color=False)
                     else:
                         await self._send_light_step(color=True)
                 elif tgt != LIGHT_NO_CHANGE:
-                    if cur == tgt:
+                    if cur == int(tgt):
                         _LOGGER.warning(
                             "Licht-Helligkeit erreicht: %s (Ziel=%s) attempts=%d",
                             cur, tgt, self._light_attempt,
@@ -2468,14 +2482,27 @@ class SpaClient:
                         self._target_light_brightness = LIGHT_NO_CHANGE
                         self._light_done.set()
                         break
+                    # Richtung: Panel-Cycle geht 100→80→…→0→(an)
                     await self._send_light_step(color=False)
+                    if last_cur is not None and cur == last_cur:
+                        stagnant += 1
+                    else:
+                        stagnant = 0
+                    last_cur = cur
+                    if stagnant >= 4:
+                        _LOGGER.warning(
+                            "Licht: keine Änderung nach %d Presses (cur=%s) – Force-Pause",
+                            stagnant, cur,
+                        )
+                        await asyncio.sleep(1.2)
+                        stagnant = 0
                 else:
                     self._light_done.set()
                     break
 
-                # CTS-Fenster abwarten (wir sind NICHT im Receiver – blockieren ok)
                 await self._wait_pending_clear(timeout=2.5)
-                await asyncio.sleep(0.7)  # Board braucht Zeit für CA-Update
+                # Board braucht Zeit für CA-Update (Panel ~0.6–1.0s zwischen Presses)
+                await asyncio.sleep(0.9)
 
             try:
                 if self._light_done.is_set():
