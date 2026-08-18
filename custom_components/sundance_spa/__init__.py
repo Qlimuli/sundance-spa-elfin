@@ -853,18 +853,23 @@ class SpaClient:
         try:
             await asyncio.wait_for(self._channel_ready.wait(), timeout=15.0)
         except asyncio.TimeoutError:
-            self._assigned_channel = CMD_CHANNEL  # Cameo: Panel + wir auf 0x10
+            self._assigned_channel = CMD_CHANNEL
             self._channel_ready.set()
             _LOGGER.warning("Channel-Timeout – Fallback 0x%02X", CMD_CHANNEL)
-        # Cameo iTouch: C6/Befehle nur auf 0x10 wirksam – Kanal erzwingen
-        self._assigned_channel = CMD_CHANNEL
+        # Eigenen Handshake-Kanal behalten (nicht Panel 0x10 spoofen).
+        # Temp-C6 geht weiter explizit auf 0x10 (Cameo-Quirk); Licht-C7
+        # nutzt _light_channel() = eigener Kanal, Fallback 0x10.
+        if self._assigned_channel is None:
+            self._assigned_channel = CMD_CHANNEL
         self._channel_ready.set()
         self._last_rx_ts = time.monotonic()
-        _LOGGER.info(
-            "Spa verbunden: %s:%s – Channel assigned: 0x%02X",
+        _LOGGER.warning(
+            "Spa verbunden: %s:%s – own_channel=0x%02X panel_ch=0x%02X "
+            "(Temp→0x10, Licht→own)",
             self.host,
             self.port,
             self._assigned_channel or 0,
+            CMD_CHANNEL,
         )
 
     def _reset_channel_state(self) -> None:
@@ -959,19 +964,17 @@ class SpaClient:
                         [f"0x{c:02X}" for c in self._discovered_channels],
                     )
 
-                # Immer flushen wenn Pending wartet – Cameo oft nur 1 Kanal
+                # Pending flushen: zuerst Pakete für diesen CTS-Kanal,
+                # sonst eigenes Assignment (Cameo oft nur 1 aktiver Slot).
                 if self._pending:
+                    self._cts_own += 1
+                    await self._flush_pending(channel)
                     if (
                         self._assigned_channel is not None
-                        and channel == self._assigned_channel
+                        and self._assigned_channel != channel
+                        and self._pending
                     ):
-                        self._cts_own += 1
-                        await self._flush_pending(channel)
-                    elif self._assigned_channel is not None:
-                        self._cts_own += 1
                         await self._flush_pending(self._assigned_channel)
-                    else:
-                        await self._flush_pending(channel)
 
                 # Idle-Kanal wählen, falls noch kein Assignment
                 if self._detect_state < DETECT_CHANNEL_CYCLES:
@@ -1345,21 +1348,43 @@ class SpaClient:
         )
 
 
-    async def _queue_raw(self, pkt: bytes) -> None:
+    async def _queue_raw(
+        self, pkt: bytes, channel: int | None = None, *, keep_frame: bool = False
+    ) -> None:
         """Reiht ein fertiges Paket ein (C7/C6/Direct-Set).
 
-        Nicht blockieren (kann aus Receiver kommen). Bei vollem Slot:
-        ältestes verwerfen und neues einreihen.
+        keep_frame=True: Kanal+CRC im Paket nicht anfassen (wichtig für C7 –
+        verschlüsselter Frame inkl. korrekter CRC darf nicht umgeschrieben werden).
         """
-        ch = await self._ensure_channel()
-        # Kanal im Paket ggf. anpassen (Byte 2) + CS neu
-        if len(pkt) > 2:
-            ba = bytearray(pkt)
-            ba[2] = ch & 0xFF
-            ml = ba[1]
-            if len(ba) > ml:
-                ba[ml] = _calc_cs(ba[1:ml], ml - 1)
-            pkt = bytes(ba)
+        if keep_frame and len(pkt) > 2:
+            ch = pkt[2]
+        elif channel is not None:
+            ch = channel & 0xFF
+            if len(pkt) > 2:
+                ba = bytearray(pkt)
+                ba[2] = ch
+                ml = ba[1]
+                mtype = ba[4] if len(ba) > 4 else 0
+                if len(ba) > ml:
+                    if mtype == C7_REQ:
+                        # C7: CRC über encrypted body mit balboa_crc8
+                        ba[ml] = _balboa_crc8(ba[1:ml])
+                    else:
+                        ba[ml] = _calc_cs(ba[1:ml], ml - 1)
+                pkt = bytes(ba)
+        else:
+            ch = await self._ensure_channel()
+            if len(pkt) > 2:
+                ba = bytearray(pkt)
+                ba[2] = ch & 0xFF
+                ml = ba[1]
+                mtype = ba[4] if len(ba) > 4 else 0
+                if len(ba) > ml:
+                    if mtype == C7_REQ:
+                        ba[ml] = _balboa_crc8(ba[1:ml])
+                    else:
+                        ba[ml] = _calc_cs(ba[1:ml], ml - 1)
+                pkt = bytes(ba)
 
         async with self._pending_lock:
             if len(self._pending) >= MAX_PENDING_CC:
@@ -1644,18 +1669,19 @@ class SpaClient:
 
         use_synth = stall < (TEMP_STALL_BEFORE_FALLBACK + 10)
         if use_synth:
-            pkt = _build_c6_plain(btn, b6, self._assigned_channel)
+            tch = self._temp_channel()
+            pkt = _build_c6_plain(btn, b6, tch)
             _LOGGER.warning(
                 "Temp-SYNTH C6 %s btn=0x%02X b6=0x%02X xor=0x%02X "
-                "result=%.1f cur=%.1f attempt=%d stall=%d",
+                "result=%.1f cur=%.1f attempt=%d stall=%d ch=0x%02X",
                 "UP" if warmer else "DOWN",
                 btn, b6, btn ^ b6, result_temp, cur,
-                self._command_attempts + 1, stall,
+                self._command_attempts + 1, stall, tch,
             )
             self._last_temp_code = (0xC6, btn, b6)
             self._last_temp_warmer = warmer
             self._temp_synth_salt = salt + 1
-            await self._queue_raw(pkt)
+            await self._queue_raw(pkt, channel=tch)
             self._last_temp_cmd_ts = time.monotonic()
             self._command_attempts += 1
             self._temp_check = TEMP_STATUS_WAIT
@@ -1713,7 +1739,8 @@ class SpaClient:
 
         idx = int(getattr(self, "_temp_code_idx", 0)) % len(codes)
         mtype, btn, b6 = codes[idx]
-        pkt = _build_cc(btn, self._assigned_channel, mtype, b6)
+        tch = self._temp_channel()
+        pkt = _build_cc(btn, tch, mtype, b6)
         scores = getattr(self, "_c6_score", {})
         locked = getattr(self, "_temp_locked_code", None) == (mtype, btn, b6)
         cur_b = getattr(self, "_temp_current_bucket", None)
@@ -2066,32 +2093,28 @@ class SpaClient:
             self._light_done.set()
             return
 
-        self._assigned_channel = CMD_CHANNEL
         attempt = self._light_attempt
-        ch = CMD_CHANNEL
-
-        if color:
-            # Farbe/Modus: CC 0xF2 (Balboa light-color) + C7-Cycle als Fallback
-            if attempt % 2 == 0:
-                _LOGGER.warning("Licht COLOR CC-F2 attempt=%d", attempt + 1)
-                await self._queue_cc(0xF2, CC_REQ, 0x00)
-            else:
-                key_byte = (0x17 + attempt * 0x29) & 0xFF
-                pkt = _build_c7(LIGHT_C7_BTN, LIGHT_C7_B6, ch, key_byte=key_byte)
-                _LOGGER.warning(
-                    "Licht C7-CYCLE (color-fallback) key=0x%02X attempt=%d pkt=%s",
-                    key_byte, attempt + 1, pkt.hex(" "),
-                )
-                await self._queue_raw(pkt)
+        # Gerade Attempts: eigener Handshake-Kanal; ungerade: Panel 0x10
+        # (Claude: C7 ggf. an Slot-Ownership gebunden, 0x10-Spoof droppt)
+        if attempt % 2 == 0:
+            ch = self._light_channel()
         else:
-            # Primär: panel-identisches C7, key rotiert
-            key_byte = (0x17 + attempt * 0x29) & 0xFF
+            ch = CMD_CHANNEL
+        key_byte = (0x17 + attempt * 0x29) & 0xFF
+
+        if color and attempt % 3 == 0:
+            _LOGGER.warning(
+                "Licht COLOR CC-F2 attempt=%d ch=0x%02X", attempt + 1, ch
+            )
+            await self._queue_cc(0xF2, CC_REQ, 0x00)
+        else:
             pkt = _build_c7(LIGHT_C7_BTN, LIGHT_C7_B6, ch, key_byte=key_byte)
             _LOGGER.warning(
-                "Licht C7-CYCLE key=0x%02X attempt=%d pkt=%s",
-                key_byte, attempt + 1, pkt.hex(" "),
+                "Licht C7-CYCLE key=0x%02X ch=0x%02X own=0x%02X attempt=%d pkt=%s",
+                key_byte, ch, self._assigned_channel or 0, attempt + 1, pkt.hex(" "),
             )
-            await self._queue_raw(pkt)
+            # Frame unverändert einreihen (kein Kanal/CRC-Rewrite)
+            await self._queue_raw(pkt, channel=ch, keep_frame=True)
 
         self._light_attempt += 1
 
@@ -2179,8 +2202,20 @@ class SpaClient:
             return dict(self._lights) if self._lights else None
 
     async def _ensure_channel(self) -> int:
-        # Cameo: immer 0x10 – C6/CC auf anderen Kanälen greifen nicht
-        self._assigned_channel = CMD_CHANNEL
+        """Eigener Kanal aus Handshake; Fallback Panel-0x10."""
+        if self._assigned_channel is None:
+            self._assigned_channel = CMD_CHANNEL
+        return self._assigned_channel
+
+    def _temp_channel(self) -> int:
+        """Cameo: Temperatur-C6 nur auf Panel-Kanal 0x10 wirksam."""
+        return CMD_CHANNEL
+
+    def _light_channel(self) -> int:
+        """Licht: eigenen Kanal bevorzugen (0x10 = Panel-Spoof oft tot für C7)."""
+        ch = self._assigned_channel
+        if ch is not None and ch != 0:
+            return ch
         return CMD_CHANNEL
 
     async def _force_temp_range_high(self) -> None:
