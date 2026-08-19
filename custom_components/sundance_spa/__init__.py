@@ -2077,12 +2077,21 @@ class SpaClient:
 
 
     async def _send_light_step(self, color: bool = False) -> None:
-        """Ein Licht-Zyklus-Schritt (C7 Klartext 0x2F/0x33, key frei).
+        """Ein Licht-Zyklus-Schritt.
 
-        Panel-Taste = Cycle 100→80→60→40→20→0→…; kein Absolut-Set.
-        key_byte ist Nonce (self-describing cipher), beliebig wählbar.
+        Panel: C7 encrypted 0x2F/0x33 auf ch 0x10 wird akzeptiert.
+        Unsere C7-ENC (byte-identisch) werden ignoriert.
+        Temp funktioniert mit unverschlüsseltem C6 auf 0x10 → gleiche Idee.
+
+        Varianten:
+          0-2:   C7-ENC Panel-Kanal 0x10
+          3-5:   C7-ENC eigener Kanal
+          6-8:   CC Klartext 0x2F/0x33 auf 0x10
+          9-11:  CC Klartext btn=241 auf 0x10
+          12-14: C6 Klartext 0x2F/0x33 auf 0x10
+          15+:   C7-ENC 0x10 Retry
         """
-        if self._light_attempt >= 24:
+        if self._light_attempt >= 20:
             if not getattr(self, "_light_exhausted_logged", False):
                 _LOGGER.error("Licht-Versuche erschöpft – Abbruch")
                 self._light_exhausted_logged = True
@@ -2094,27 +2103,50 @@ class SpaClient:
             return
 
         attempt = self._light_attempt
-        # Gerade Attempts: eigener Handshake-Kanal; ungerade: Panel 0x10
-        # (Claude: C7 ggf. an Slot-Ownership gebunden, 0x10-Spoof droppt)
-        if attempt % 2 == 0:
-            ch = self._light_channel()
-        else:
-            ch = CMD_CHANNEL
+        panel_ch = CMD_CHANNEL  # 0x10
+        own_ch = (
+            self._light_channel()
+            if hasattr(self, "_light_channel")
+            else (self._assigned_channel or CMD_CHANNEL)
+        )
         key_byte = (0x17 + attempt * 0x29) & 0xFF
 
-        if color and attempt % 3 == 0:
-            _LOGGER.warning(
-                "Licht COLOR CC-F2 attempt=%d ch=0x%02X", attempt + 1, ch
-            )
+        if color and attempt % 4 == 0:
+            _LOGGER.warning("Licht COLOR CC-F2 attempt=%d", attempt + 1)
             await self._queue_cc(0xF2, CC_REQ, 0x00)
-        else:
-            pkt = _build_c7(LIGHT_C7_BTN, LIGHT_C7_B6, ch, key_byte=key_byte)
+        elif attempt < 3:
+            pkt = _build_c7(LIGHT_C7_BTN, LIGHT_C7_B6, panel_ch, key_byte=key_byte)
             _LOGGER.warning(
-                "Licht C7-CYCLE key=0x%02X ch=0x%02X own=0x%02X attempt=%d pkt=%s",
-                key_byte, ch, self._assigned_channel or 0, attempt + 1, pkt.hex(" "),
+                "Licht C7-ENC panel_ch key=0x%02X attempt=%d pkt=%s",
+                key_byte, attempt + 1, pkt.hex(" "),
             )
-            # Frame unverändert einreihen (kein Kanal/CRC-Rewrite)
-            await self._queue_raw(pkt, channel=ch, keep_frame=True)
+            await self._queue_raw(pkt, channel=panel_ch, keep_frame=True)
+        elif attempt < 6:
+            pkt = _build_c7(LIGHT_C7_BTN, LIGHT_C7_B6, own_ch, key_byte=key_byte)
+            _LOGGER.warning(
+                "Licht C7-ENC own=0x%02X key=0x%02X attempt=%d pkt=%s",
+                own_ch, key_byte, attempt + 1, pkt.hex(" "),
+            )
+            await self._queue_raw(pkt, channel=own_ch, keep_frame=True)
+        elif attempt < 9:
+            _LOGGER.warning("Licht CC-2F33 attempt=%d ch=0x10", attempt + 1)
+            pkt = _build_cc(LIGHT_C7_BTN, panel_ch, CC_REQ, LIGHT_C7_B6)
+            await self._queue_raw(pkt, channel=panel_ch, keep_frame=True)
+        elif attempt < 12:
+            _LOGGER.warning("Licht CC-241 attempt=%d ch=0x10", attempt + 1)
+            pkt = _build_cc(BTN_LIGHT, panel_ch, CC_REQ, 0)
+            await self._queue_raw(pkt, channel=panel_ch, keep_frame=True)
+        elif attempt < 15:
+            _LOGGER.warning("Licht C6-2F33 attempt=%d ch=0x10", attempt + 1)
+            pkt = _build_cc(LIGHT_C7_BTN, panel_ch, C6_REQ, LIGHT_C7_B6)
+            await self._queue_raw(pkt, channel=panel_ch, keep_frame=True)
+        else:
+            pkt = _build_c7(LIGHT_C7_BTN, LIGHT_C7_B6, panel_ch, key_byte=key_byte)
+            _LOGGER.warning(
+                "Licht C7-ENC retry key=0x%02X attempt=%d pkt=%s",
+                key_byte, attempt + 1, pkt.hex(" "),
+            )
+            await self._queue_raw(pkt, channel=panel_ch, keep_frame=True)
 
         self._light_attempt += 1
 
