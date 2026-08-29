@@ -2276,22 +2276,6 @@ class SpaClient:
         """
         return
 
-    async def _ensure_pumps_off_for_heating(self) -> None:
-        """Cameo 880 (40A): Temperaturänderung nur bei ausgeschalteten Jet-Pumpen."""
-        for _ in range(6):
-            snap = await self._status_snapshot()
-            if not snap:
-                return
-            if not snap["pump1"] and not snap["pump2"]:
-                return
-            if snap["pump1"]:
-                await self._queue_cc(BTN_PUMP1)
-                await self._wait_pending_clear()
-            if snap["pump2"]:
-                await self._queue_cc(BTN_PUMP2)
-                await self._wait_pending_clear()
-            await asyncio.sleep(0.8)
-
     async def set_temperature(self, target: float) -> None:
         """Solltemperatur steuern: C6-Learn → Klartext-CC → Direct-Set."""
         target = max(TEMP_MIN_C, min(TEMP_MAX_C, round(target * 2) / 2.0))
@@ -2374,12 +2358,6 @@ class SpaClient:
                 self._adaptive_temp_attempts(target),
                 self._temp_locked_code,
             )
-
-            # Cameo 880 (40A): Jet-Pumpen aus, sonst ignoriert Panel Temp-Tasten
-            try:
-                await self._ensure_pumps_off_for_heating()
-            except Exception as exc:  # noqa: BLE001
-                _LOGGER.warning("Pumpen-Aus vor Temp fehlgeschlagen: %s", exc)
 
             # High-Range VOR dem Hochlaufen – sonst endet UP bei ~33–34 und
             # springt auf den Low-Range-Soll (~28.5) zurück (Log-Muster 34↔28.5).
