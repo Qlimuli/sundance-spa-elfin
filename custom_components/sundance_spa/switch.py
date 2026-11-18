@@ -1,6 +1,8 @@
 """Sundance Spa – Switch Entities (Pumpen, Zirk, ClearRay, Blower)."""
 from __future__ import annotations
 
+import asyncio
+
 from dataclasses import dataclass
 from typing import Callable
 
@@ -40,6 +42,12 @@ SWITCH_TYPES: list[SpaSwitch] = [
         icon_on="mdi:pump", icon_off="mdi:pump-off",
         button=BTN_PUMP1,
         getter=lambda s: s["pump1"],
+    ),
+    SpaSwitch(
+        key="pump1_low", name="Pumpe 1 niedrig",
+        icon_on="mdi:pump", icon_off="mdi:pump-off",
+        button=BTN_PUMP1,
+        getter=lambda s: s.get("pump1_low", False),
     ),
     SpaSwitch(
         key="pump2", name="Pumpe 2",
@@ -155,10 +163,23 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
             self.async_write_ha_state()
             await self.coordinator.async_request_refresh()
             return
-        if self.is_on:
-            return
-        await self.coordinator.client.send_button(self._sw.button, self._sw.mtype)
-        await self.coordinator.client.wait_status(n=6, timeout=4.0)
+        await self._press_until(True)
+
+    async def _press_until(self, want: bool) -> None:
+        """Taste drücken bis Status passt (Pumpe 1 zykliert aus→niedrig→hoch→aus)."""
+        client = self.coordinator.client
+        for _ in range(3):
+            live = client.status  # direkt vom Bus, nicht vom (entprellten) Coordinator
+            if live is not None:
+                done = bool(self._sw.getter(live)) is want
+                if done and not want and self._sw.key == "pump1_low":
+                    # "Niedrig aus" heißt Pumpe 1 ganz aus – nicht auf Hoch stehen bleiben
+                    done = not live.get("pump1", False)
+                if done:
+                    break
+            await client.send_button(self._sw.button, self._sw.mtype)
+            await client.wait_status(n=6, timeout=4.0)
+            await asyncio.sleep(0.6)
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs) -> None:
@@ -168,9 +189,5 @@ class SpaSwitch_(CoordinatorEntity, SwitchEntity):
             self.async_write_ha_state()
             await self.coordinator.async_request_refresh()
             return
-        if not self.is_on:
-            return
-        await self.coordinator.client.send_button(self._sw.button, self._sw.mtype)
-        await self.coordinator.client.wait_status(n=6, timeout=4.0)
-        await self.coordinator.async_request_refresh()
+        await self._press_until(False)
 

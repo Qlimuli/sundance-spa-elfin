@@ -67,6 +67,12 @@ SENSOR_TYPES: list[SpaSensorDescription] = [
         category=EntityCategory.DIAGNOSTIC,
     ),
     SpaSensorDescription(
+        key="display_code", name="Display-Code",
+        icon="mdi:alert-circle-outline",
+        getter=lambda s, _l: s.get("display_code"),
+        category=EntityCategory.DIAGNOSTIC,
+    ),
+    SpaSensorDescription(
         key="light_mode", name="Licht-Modus",
         icon="mdi:lightbulb-variant-outline",
         getter=lambda _s, l: l.get("mode", "Unbekannt") if l else "Unbekannt",
@@ -148,3 +154,12 @@ class SpaSensor(CoordinatorEntity, SensorEntity):
             return self._desc.getter(s, l)
         except (KeyError, TypeError, AttributeError):
             return None
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        # Rohstatus mitschreiben, damit unbekannte Fehlercodes später dekodiert werden können
+        if self._desc.key != "display_code" or not self.coordinator.data:
+            return None
+        s = self.coordinator.data.get("status") or {}
+        raw = s.get("raw")
+        return {"raw_status": " ".join(f"{b:02x}" for b in raw)} if raw else None

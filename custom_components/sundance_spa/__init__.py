@@ -60,6 +60,7 @@ BTN_PUMP2          = 229
 BTN_CLEARRAY       = 239
 BTN_LIGHT          = 241
 BTN_LIGHT_COLOR    = 242
+LIGHT_CC_680       = 243   # Sundance 680: dekodierter Panel-Code der Lichttaste
 # Cameo 880: Panel sendet C7 (verschlüsselt), Klartext nach Decrypt = 0x2F / 0x33
 # Helligkeitsstufen am Panel: 0 / 20 / 40 / 60 / 80 / 100 (nicht 33/66)
 LIGHT_C7_BTN       = 0x2F
@@ -376,7 +377,8 @@ SEED_UP_C6: list[tuple[int, int, int]] = [
 # Direct-Set 0x20 oft ignoriert → C6 primär, CC Fallback, 0x20 selten.
 TEMP_STALL_BEFORE_FALLBACK = 5
 TEMP_MAX_ATTEMPTS = 28
-TEMP_MAX_ATTEMPTS_HIGH = 48       # 34–40 °C: mehr C6-Versuche, CC hilft dort kaum
+TEMP_MAX_ATTEMPTS_HIGH = 48
+TEMP_MAX_ATTEMPTS_F = 130          # °F-Board: 1-°F-Schritte brauchen mehr Sendungen       # 34–40 °C: mehr C6-Versuche, CC hilft dort kaum
 TEMP_LEARN_POOL_MAX = 24
 TEMP_BUCKET_POOL_MAX = 16
 TEMP_RANGE_JUMP_C = 2.5
@@ -433,13 +435,43 @@ TEMP_EXPLORE_C6: tuple[tuple[int, int, int], ...] = (
 
 
 
+# ── Fahrenheit-Boards (z.B. Sundance 680 mit °F-Panel) ─────────────────
+# Dort sind Ist/Soll im C4-Status und das C6-Ergebnisbyte direkt °F
+# (100 = 100 °F) statt °C×2 wie beim Cameo 880. Erkennung: ein Rohwert
+# > 80 ist als °C×2 unmöglich (max 40 °C) → Board ist °F (sticky).
+_FAHRENHEIT_BOARD = False
+TEMP_MIN_F = 50
+TEMP_MAX_F = 104
+
+
+def _note_raw_temp(raw: int) -> None:
+    global _FAHRENHEIT_BOARD
+    if not _FAHRENHEIT_BOARD and 80 < raw <= 120:
+        _FAHRENHEIT_BOARD = True
+        _LOGGER.warning("Fahrenheit-Board erkannt (Rohwert %d) – °F-Kodierung aktiv", raw)
+
+
+def _c_to_f_int(celsius: float) -> int:
+    return int(round(float(celsius) * 9 / 5 + 32))
+
+
+def _f_to_c(fahrenheit: float) -> float:
+    return round((float(fahrenheit) - 32) * 5 / 9, 2)
+
+
+def _temp_to_raw(celsius: float) -> int:
+    """Sollwert → Rohbyte (°F-Board: ganze °F, sonst °C×2)."""
+    if _FAHRENHEIT_BOARD:
+        return max(TEMP_MIN_F, min(TEMP_MAX_F, _c_to_f_int(celsius)))
+    return max(33, min(80, int(round(float(celsius) * 2.0))))
+
+
 def _c6_xor_for_temp(celsius: float) -> int:
     """Cameo C6: btn^b6 == round(°C*2) ^ 0x88 (20/20 LEARN-Punkte verifiziert).
 
     Codiert den *Ergebnis*-Sollwert nach dem ±0.5-Schritt.
     """
-    raw = int(round(float(celsius) * 2.0))
-    raw = max(33, min(80, raw))
+    raw = _temp_to_raw(celsius)
     return (raw ^ 0x88) & 0xFF
 
 
@@ -469,9 +501,7 @@ def _build_c6_plain(btn: int, b6: int, channel: int = CMD_CHANNEL) -> bytes:
 
 def _build_set_temp(channel: int, celsius: float) -> bytes:
     """Direkt-Solltemperatur (Msg 0x20). Wert = °C × 2 (halbe Grad)."""
-    val = int(round(celsius * 2.0))
-    # 16.5 … 40.0 °C → raw 33 … 80
-    val = max(33, min(80, val))
+    val = _temp_to_raw(celsius)
     ml = 6
     msg = bytearray(8)
     msg[0] = M_STARTEND
@@ -537,6 +567,17 @@ def _decode_set_temp(raw: int, _celsius_scale: bool) -> float:
     return raw / 2.0
 
 
+def _decode_raw_temp(raw: int, is_setpoint: bool) -> float | None:
+    """Ist/Soll-Rohwert → °C (°F-Board oder Cameo-°C×2)."""
+    if raw == 255:
+        return None
+    if _FAHRENHEIT_BOARD:
+        return _f_to_c(raw)
+    if is_setpoint:
+        return _decode_set_temp(raw, True)
+    return raw / 2.0
+
+
 def _brightness_step(level_pct: int) -> int:
     """Cameo-Helligkeitsstufen (0 / 20 / 40 / 60 / 80 / 100)."""
     if level_pct <= 0:
@@ -559,13 +600,18 @@ def _decode_c4(raw: bytes) -> dict | None:
     circ = (d[1] >> 6) & 1
     celsius_scale = bool(d[9] & 0x01) if len(d) > 9 else True
     set_raw = d[8]
+    cur_raw = d[5] ^ 2
+    if cur_raw != 255:
+        _note_raw_temp(cur_raw)
+    _note_raw_temp(set_raw)
     return {
         "time":         f"{d[0] ^ 6:02d}:{d[11]:02d}",
-        "cur_temp":     (d[5] ^ 2) / 2.0 if (d[5] ^ 2) != 255 else None,
-        "set_temp":     _decode_set_temp(set_raw, celsius_scale),
+        "cur_temp":     _decode_raw_temp(cur_raw, False),
+        "set_temp":     _decode_raw_temp(set_raw, True),
         "heat_active":  bool((d[10] >> 6) & 1),
         "heat_mode":    HEAT_MODE_MAP.get(d[6], f"0x{d[6]:02X}"),
-        "pump1":        bool((d[2] >> 4) & 1),
+        "pump1":        bool((d[2] >> 4) & 1),   # hohe Stufe
+        "pump1_low":    bool((d[2] >> 3) & 1),   # niedrige Stufe (Sundance 680, Sniff 2026-11-18)
         "pump2":        bool((d[1] >> 2) & 1),
         "circ":         bool(circ),
         "circ_manual":  bool((d[1] >> 7) & 1),
@@ -830,6 +876,9 @@ class SpaClient:
         target = self._target_temp if target is None else target
         if target is None:
             return TEMP_MAX_ATTEMPTS
+        if _FAHRENHEIT_BOARD:
+            # 1-°F-Schritte, ~2 Sendungen pro Schritt, bis zu 54 Schritte (50↔104 °F)
+            return TEMP_MAX_ATTEMPTS_F
         # Langer Weg (16.5↔40) und High-Range 34–38.5 brauchen mehr Versuche
         if target >= TEMP_HIGH_RANGE_FROM or target <= 22.0:
             return TEMP_MAX_ATTEMPTS_HIGH
@@ -1630,8 +1679,12 @@ class SpaClient:
             else (self._target_temp if self._target_temp != NO_CHANGE_REQUESTED else 30.0)
         )
         # Nächster Ergebnis-Sollwert (±0.5)
-        step = 0.5 if warmer else -0.5
-        result_temp = round((cur + step) * 2) / 2.0
+        if _FAHRENHEIT_BOARD:
+            # °F-Board: Panel-Schritt = 1 °F
+            result_temp = _f_to_c(_c_to_f_int(cur) + (1 if warmer else -1))
+        else:
+            step = 0.5 if warmer else -0.5
+            result_temp = round((cur + step) * 2) / 2.0
         result_temp = max(TEMP_MIN_C, min(TEMP_MAX_C, result_temp))
         # Nicht über Ziel hinaus schießen
         if self._target_temp != NO_CHANGE_REQUESTED:
@@ -2102,7 +2155,16 @@ class SpaClient:
             ch = CMD_CHANNEL
         key_byte = (0x17 + attempt * 0x29) & 0xFF
 
-        if color and attempt % 3 == 0:
+        if _FAHRENHEIT_BOARD:
+            # Sundance 680: Panel-Lichttaste = CC mit btn^b6^1 == 243 (btn = Nonce).
+            # Jeder Druck: aus → an → Farben … → aus (Sniff 2026-11-18).
+            nonce = (0x31 + attempt * 0x47) & 0xFF
+            b6 = nonce ^ LIGHT_CC_680 ^ 1
+            _LOGGER.warning(
+                "Licht CC-680 nonce=0x%02X b6=0x%02X attempt=%d", nonce, b6, attempt + 1
+            )
+            await self._queue_cc(nonce, CC_REQ, b6)
+        elif color and attempt % 3 == 0:
             _LOGGER.warning(
                 "Licht COLOR CC-F2 attempt=%d ch=0x%02X", attempt + 1, ch
             )
@@ -2278,7 +2340,10 @@ class SpaClient:
 
     async def set_temperature(self, target: float) -> None:
         """Solltemperatur steuern: C6-Learn → Klartext-CC → Direct-Set."""
-        target = max(TEMP_MIN_C, min(TEMP_MAX_C, round(target * 2) / 2.0))
+        if _FAHRENHEIT_BOARD:
+            target = _f_to_c(max(TEMP_MIN_F, min(TEMP_MAX_F, _c_to_f_int(target))))
+        else:
+            target = max(TEMP_MIN_C, min(TEMP_MAX_C, round(target * 2) / 2.0))
         async with self._cmd_lock:
             self._target_temp = NO_CHANGE_REQUESTED
             self._temp_done.set()
